@@ -1,49 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+import argparse
 import logging
-from typing import List
+import os
 import warnings
-import numpy as np
-import pandas as pd
+from io import BytesIO
+from itertools import chain, combinations, permutations
 from typing import List, Optional
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import networkx as nx
-from io import BytesIO
+import nolds
+import numpy as np
+import pandas as pd
+import pyinform
+import scipy.signal as signal
+from hurst import compute_Hc
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from tqdm import tqdm
-import pyinform
-from statsmodels.tsa.stattools import grangercausalitytests, adfuller
-from statsmodels.tsa.vector_ar.var_model import VAR
-from scipy.signal import coherence, find_peaks
-from scipy.fft import fft
+from openpyxl.utils.dataframe import dataframe_to_rows
 from scipy import stats
-from sklearn.metrics import mutual_info_score
+from scipy.fft import fft
+from scipy.signal import coherence, find_peaks
+from scipy.spatial import cKDTree
+from scipy.special import digamma
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
-from hurst import compute_Hc
-import nolds
 from statsmodels.graphics.tsaplots import plot_acf
-from itertools import chain, combinations, permutations
-import scipy.signal as signal
-from scipy.special import digamma
-from scipy.spatial import cKDTree
-import sys
-import argparse
-from math import log, isnan, sqrt, floor, ceil
+from statsmodels.tsa.stattools import adfuller, grangercausalitytests
+from statsmodels.tsa.vector_ar.var_model import VAR
+from tqdm import tqdm
 
 
-# Подавление предупреждений
-warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels.tsa.stattools")
-warnings.filterwarnings("ignore", message="nperseg = 256 is greater than input length")
-warnings.filterwarnings("ignore")
+def configure_warnings(quiet: bool = False) -> None:
+    """Настраивает предупреждения без глобального подавления."""
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        module="statsmodels.tsa.stattools",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="nperseg = 256 is greater than input length",
+    )
+    if quiet:
+        warnings.filterwarnings("ignore")
 
 
 base_path = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +69,24 @@ DEFAULT_OUTLIER_Z = 5
 DEFAULT_REGULARIZATION = 1e-8
 DEFAULT_EMBED_DIM = 3
 DEFAULT_EMBED_TAU = 1
+
+STABLE_METHODS = [
+    "correlation_full",
+    "correlation_partial",
+    "coherence_full",
+    "granger_full",
+]
+
+EXPERIMENTAL_METHODS = [
+    "mutinf_full",
+    "mutinf_partial",
+    "te_full",
+    "te_partial",
+    "te_directed",
+    "ah_full",
+    "ah_partial",
+    "ah_directed",
+]
 
 ##############################################
 # Предобработка и загрузка
@@ -165,6 +189,12 @@ def partial_correlation_matrix(df: pd.DataFrame, control: list = None, **kwargs)
                     pcor = np.nan
             out[i, j] = out[j, i] = pcor
     return out
+
+
+def partial_h2_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
+    """Возвращает квадрат частичной корреляции (H^2) для заданного контроля."""
+    pcor = partial_correlation_matrix(df, control=control, **kwargs)
+    return pcor**2
 
 def lagged_directed_correlation(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
     m = df.shape[1]
@@ -826,7 +856,8 @@ def plot_coherence_vs_frequency(series1: pd.Series, series2: pd.Series, title: s
 # Функции для экспорта данных в Excel
 ##############################################
 def add_raw_data_sheet(wb: Workbook, df: pd.DataFrame) -> None:
-    ws = wb.create_sheet("All Synthetic Data")
+    """Добавляет лист с исходными данными."""
+    ws = wb.create_sheet("Raw Data")
     ws.append(list(df.columns))
     for _, row in df.iterrows():
         ws.append(list(row))
@@ -839,7 +870,7 @@ def plot_heatmap(matrix: np.ndarray, title: str, legend_text: str = "", annotate
         ax.set_xticks([])
         ax.set_yticks([])
     else:
-        # шоб матплолиб сам не подобрал
+        # Фиксируем шкалу, чтобы избежать авто-нормализации matplotlib.
         cax = ax.imshow(matrix, cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
         fig.colorbar(cax, ax=ax)
         ax.set_title(title, fontsize=10)
@@ -938,46 +969,26 @@ def fmt_val(v):
         return f"{f:.3f}"
     except Exception:
         return "N/A"
-raw_data = None 
-
-
-
-####
+#
 # МАППИНГ
 ###
 method_mapping = {
     # ——— Correlation ———
     "correlation_full":     lambda data, lag=None, control=None: correlation_matrix(data),
     "correlation_partial":  lambda data, lag=None, control=None: partial_correlation_matrix(data, control),
-    "correlation_directed": lambda data, lag, control=None:
-                                (lagged_directed_correlation(data, lag)
-                                 if not control
-                                 else partial_directed_correlation(data, lag, control)), 
+    "correlation_directed": lambda data, lag, control=None: lagged_directed_correlation(data, lag),
 
     # ——— H² (squared corr) ———
     "h2_full":              lambda data, lag=None, control=None: correlation_matrix(data)**2,
     "h2_partial":           lambda data, lag=None, control=None: partial_h2_matrix(data, control), 
-    "h2_directed":          lambda data, lag, control=None:
-                                (lagged_directed_h2(data, lag)
-                                 if not control
-                                 else partial_directed_h2(data, lag, control)), 
+    "h2_directed":          lambda data, lag, control=None: lagged_directed_h2(data, lag),
 
     # ——— Mutual Information ———
-    "mutinf_full":          lambda data, lag=0, control=None: mutual_info_matrix(data, lag),
-    "mutinf_partial":       lambda data, lag=0, control=None: mutual_info_matrix_partial(data, control),
-    "mutinf_directed":      lambda data, lag, control=None:
-                                (lagged_directed_mutual_info(data, lag) 
-                                 if not control
-                                 else partial_directed_mutinf(data, lag, control)), 
+    "mutinf_full":          lambda data, lag=0, control=None: mutual_info_matrix(data, k=DEFAULT_K_MI),
+    "mutinf_partial":       lambda data, lag=0, control=None: mutual_info_matrix_partial(data, control, k=DEFAULT_K_MI),
 
     # ——— Coherence ———
     "coherence_full":       lambda data, lag=None, control=None: coherence_matrix(data),
-    "coherence_partial":    lambda data, lag=None, control=None: coherence_matrix_partial(data, control), 
-    "coherence_directed": lambda data, lag, control=None: (
-        lagged_directed_coherence(data, lag) 
-        if not control
-        else partial_directed_coherence(data, lag, control) 
-    ),
 
 
 # ...
@@ -1052,15 +1063,30 @@ def frequency_analysis(series: pd.Series, peak_height_ratio: float = 0.2):
     return peak_freqs, peak_amps, periods
 
 def sliding_fft_analysis(data: pd.DataFrame, window_size: int, overlap: int) -> dict:
-    logging.warning("sliding_fft_analysis is a placeholder. Implement actual logic if needed.")
+    """Экспериментальный анализ скользящего FFT (по умолчанию отключён)."""
+    logging.info("[Sliding FFT] Экспериментальная функция отключена.")
     return {}
 
-def analyze_sliding_windows_with_metric(data: pd.DataFrame, variant: str, window_size: int, overlap: int) -> dict:
-    logging.warning(f"analyze_sliding_windows_with_metric for {variant} is a placeholder. Implement actual logic if needed.")
+
+def analyze_sliding_windows_with_metric(
+    data: pd.DataFrame,
+    variant: str,
+    window_size: int,
+    overlap: int,
+) -> dict:
+    """Экспериментальный анализ скользящих окон (по умолчанию отключён)."""
+    logging.info("[Sliding Window] Экспериментальная функция отключена.")
     return {}
 
-def sliding_window_pairwise_analysis(data: pd.DataFrame, method: str, window_size: int, overlap: int) -> dict:
-    logging.warning(f"sliding_window_pairwise_analysis for {method} is a placeholder. Implement actual logic if needed.")
+
+def sliding_window_pairwise_analysis(
+    data: pd.DataFrame,
+    method: str,
+    window_size: int,
+    overlap: int,
+) -> dict:
+    """Экспериментальный парный анализ скользящих окон (по умолчанию отключён)."""
+    logging.info("[Sliding Pairwise] Экспериментальная функция отключена.")
     return {}
 
 ##############################################
@@ -1159,14 +1185,22 @@ def export_combined_informational_sheet(tool, wb: Workbook):
     current_row += 30
     ws.cell(row=current_row, column=1, value="Sliding Window Analysis Summary (Aggregated)")
     current_row += 1
-    sw_res = tool.analyze_sliding_windows("coherence_full", window_size=min(50, len(tool.data_normalized)//2), overlap=min(25, len(tool.data_normalized)//4))
-    legend_text = "Метод: coherence_full, Окно: 50"
-    buf_sw = tool.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
-    img_sw = Image(buf_sw)
-    img_sw.width = 700
-    img_sw.height = 400
-    ws.add_image(img_sw, f"A{current_row}")
-    current_row += 20
+    sw_res = tool.analyze_sliding_windows(
+        "coherence_full",
+        window_size=min(50, len(tool.data_normalized) // 2),
+        overlap=min(25, len(tool.data_normalized) // 4),
+    )
+    if sw_res:
+        legend_text = "Метод: coherence_full, Окно: 50"
+        buf_sw = tool.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
+        img_sw = Image(buf_sw)
+        img_sw.width = 700
+        img_sw.height = 400
+        ws.add_image(img_sw, f"A{current_row}")
+        current_row += 20
+    else:
+        ws.append(["Sliding Window Analysis отключён или нет данных."])
+        current_row += 2
     ws.cell(row=current_row, column=1, value="Pairwise Lag Analysis (пример для первой пары)")
     current_row += 1
     if len(tool.data.columns) >= 2:
@@ -1320,7 +1354,7 @@ def create_table_of_contents(wb: Workbook):
 # Класс BigMasterTool 
 ##############################################
 class BigMasterTool:
-    def __init__(self, data: pd.DataFrame = None) -> None:
+    def __init__(self, data: pd.DataFrame = None, enable_experimental: bool = False) -> None:
         if data is not None:
             data = data.loc[:, (data != data.iloc[0]).any()]
             
@@ -1337,12 +1371,30 @@ class BigMasterTool:
         self.lag_results: dict = {}
         self.fft_results: dict = {}
         self.data_type: str = 'unknown'
+        self.enable_experimental = enable_experimental
         self.lag_ranges = {v: range(1, 21) for v in method_mapping}
-        self.undirected_methods = ["correlation_full", "correlation_partial", "h2_full", "h2_partial",
-                                   "mutinf_full", "mutinf_partial", "coherence_full", "coherence_partial"]
-        self.directed_methods = ["correlation_directed", "h2_directed", "mutinf_directed", "coherence_directed",
-                                 "granger_full", "granger_partial", "granger_directed", "te_full",
-                                 "te_partial", "te_directed", "ah_full", "ah_partial", "ah_directed"]
+        self.undirected_methods = [
+            "correlation_full",
+            "correlation_partial",
+            "h2_full",
+            "h2_partial",
+            "mutinf_full",
+            "mutinf_partial",
+            "coherence_full",
+        ]
+        self.directed_methods = [
+            "correlation_directed",
+            "h2_directed",
+            "granger_full",
+            "granger_partial",
+            "granger_directed",
+            "te_full",
+            "te_partial",
+            "te_directed",
+            "ah_full",
+            "ah_partial",
+            "ah_directed",
+        ]
 
     def load_data_excel(self, filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
         self.data = load_or_generate(filepath, log_transform, remove_outliers, normalize, fill_missing, check_stationarity)
@@ -1480,7 +1532,14 @@ class BigMasterTool:
 
         self.results = {}
         self.lag_results = {}
-        self.fft_results = sliding_fft_analysis(self.data_normalized, window_size=min(200, len(self.data_normalized)//2), overlap=min(100, len(self.data_normalized)//4))
+        if self.enable_experimental:
+            self.fft_results = sliding_fft_analysis(
+                self.data_normalized,
+                window_size=min(200, len(self.data_normalized) // 2),
+                overlap=min(100, len(self.data_normalized) // 4),
+            )
+        else:
+            self.fft_results = {}
         
         # база, лаг 1
         for variant in method_mapping.keys():
@@ -1488,10 +1547,17 @@ class BigMasterTool:
         
         # оптимиз лаг для директед
         directed_methods_for_lag_analysis = [
-            "correlation_directed", "h2_directed", "mutinf_directed", "coherence_directed",
-            "granger_full", "granger_partial", "granger_directed", # грейндж -- директед
-            "te_full", "te_partial", "te_directed",
-            "ah_full", "ah_partial", "ah_directed"
+            "correlation_directed",
+            "h2_directed",
+            "granger_full",
+            "granger_partial",
+            "granger_directed",
+            "te_full",
+            "te_partial",
+            "te_directed",
+            "ah_full",
+            "ah_partial",
+            "ah_directed",
         ]
         for variant in directed_methods_for_lag_analysis:
             if variant in method_mapping: # d
@@ -1504,14 +1570,17 @@ class BigMasterTool:
         logging.info("[RunAll] Все методы завершены.")
 
     def analyze_sliding_windows(self, variant: str, window_size: int = 100, overlap: int = 50, threshold: float = 0.2) -> dict:
-        if self.data_normalized.empty: return {}
-        #
+        if self.data_normalized.empty:
+            return {}
+        if not self.enable_experimental:
+            return {}
         actual_window_size = min(window_size, len(self.data_normalized))
         actual_overlap = min(overlap, actual_window_size // 2) 
         return analyze_sliding_windows_with_metric(self.data_normalized, variant, actual_window_size, actual_overlap)
 
     def sliding_window_pairwise_analysis(self, method: str, window_size: int = 50, overlap: int = 25) -> dict:
-        if self.data_normalized.empty: return {}
+        if self.data_normalized.empty or not self.enable_experimental:
+            return {}
         actual_window_size = min(window_size, len(self.data_normalized))
         actual_overlap = min(overlap, actual_window_size // 2)
         return sliding_window_pairwise_analysis(self.data_normalized, method, actual_window_size, actual_overlap)
@@ -1599,7 +1668,7 @@ class BigMasterTool:
 
         orig_vals = np.abs(orig[idx_i, idx_j])
         
-        # здесь могут юбыть наны
+        # Здесь могут быть NaN.
         if np.any(np.isnan(orig_vals)) or n_permutations == 0:
             p_matrix = np.full_like(orig, np.nan)
             sig = np.full_like(orig, False, dtype=bool)
@@ -2319,30 +2388,95 @@ class BigMasterTool:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute connectivity measures for multivariate time series.")
-    parser.add_argument("input_file", help="Path to input CSV or Excel file with time series data")
-    parser.add_argument("--lags", type=int, default=DEFAULT_MAX_LAG, help="Lag or model order (for Granger, TE, etc.)")
-    parser.add_argument("--log", action="store_true", help="Apply logarithm transform to data (for positive-valued data)")
-    parser.add_argument("--no-outliers", action="store_true", help="Disable outlier removal")
-    parser.add_argument("--no-normalize", action="store_true", help="Disable normalization of data")
-    parser.add_argument("--no-stationarity-check", action="store_true", help="Disable stationarity check (ADF test)")
-    parser.add_argument("--graph-threshold", type=float, default=0.5, help="Threshold for graph edges (weight >= threshold)")
-    parser.add_argument("--output", help="Output Excel file path (if not specified, auto-generated)")
-    args = parser.parse_args() if len(sys.argv) > 1 else parser.parse_args(["данные.xlsx"])
+    parser = argparse.ArgumentParser(
+        description="Compute connectivity measures for multivariate time series."
+    )
+    parser.add_argument(
+        "input_file",
+        help="Path to input CSV or Excel file with time series data",
+    )
+    parser.add_argument(
+        "--lags",
+        type=int,
+        default=DEFAULT_MAX_LAG,
+        help="Lag or model order (for Granger, TE, etc.)",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Apply logarithm transform to data (for positive-valued data)",
+    )
+    parser.add_argument(
+        "--no-outliers",
+        action="store_true",
+        help="Disable outlier removal",
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="Disable normalization of data",
+    )
+    parser.add_argument(
+        "--no-stationarity-check",
+        action="store_true",
+        help="Disable stationarity check (ADF test)",
+    )
+    parser.add_argument(
+        "--graph-threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for graph edges (weight >= threshold)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output Excel file path (defaults to TimeSeriesAnalysis/AllMethods_Full.xlsx)",
+    )
+    parser.add_argument(
+        "--quiet-warnings",
+        action="store_true",
+        help="Suppress most warnings for cleaner CLI output.",
+    )
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help="Enable experimental sliding-window analyses.",
+    )
+    args = parser.parse_args()
 
-    filepath = os.path.join(base_path, args.input_file)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    configure_warnings(quiet=args.quiet_warnings)
 
-    tool = BigMasterTool()
-    tool.load_data_excel(filepath, log_transform=args.log, remove_outliers=not args.no_outliers,
-                            normalize=not args.no_normalize, fill_missing=True, check_stationarity=not args.no_stationarity_check)
+    filepath = os.path.abspath(args.input_file)
+    output_path = args.output or os.path.join(save_folder, "AllMethods_Full.xlsx")
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    tool = BigMasterTool(enable_experimental=args.experimental)
+    tool.lag_ranges = {v: range(1, args.lags + 1) for v in method_mapping}
+    tool.load_data_excel(
+        filepath,
+        log_transform=args.log,
+        remove_outliers=not args.no_outliers,
+        normalize=not args.no_normalize,
+        fill_missing=True,
+        check_stationarity=not args.no_stationarity_check,
+    )
     tool.run_all_methods()
-    final_path = os.path.join(save_folder, "AllMethods_Full.xlsx")
-    tool.export_big_excel(final_path, threshold=args.graph_threshold, window_size=100, overlap=50,
-                            log_transform=args.log, remove_outliers=not args.no_outliers,
-                            normalize=not args.no_normalize, fill_missing=True, check_stationarity=not args.no_stationarity_check)
+    tool.export_big_excel(
+        output_path,
+        threshold=args.graph_threshold,
+        window_size=100,
+        overlap=50,
+        log_transform=args.log,
+        remove_outliers=not args.no_outliers,
+        normalize=not args.no_normalize,
+        fill_missing=True,
+        check_stationarity=not args.no_stationarity_check,
+    )
 
-    print("Анализ завершён, результаты сохранены в:", final_path)
-    logging.info("[Export] Лист Undirected Methods добавлен.")
-    logging.info("[Export] Лист Directed Methods добавлен.")
-    logging.info("[Summary] Лист Summary заполнен.")
-    logging.info(f"[Export] Excel файл сохранён: {final_path}")
+    print("Анализ завершён, результаты сохранены в:", output_path)

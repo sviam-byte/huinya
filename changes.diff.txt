@@ -1,0 +1,1328 @@
+diff --git a/README.md b/README.md
+index 6458fb8728fab6676a7ebbe77b3ebdd11dd368c5..cec98a337ac864c0d0465017a2ceb5fae74c19d9 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,46 @@
+-# huinya
+\ No newline at end of file
++# Time Series Connectivity Toolkit
++
++Минимальный набор для демонстрации анализа связей между временными рядами и экспорта отчёта в Excel.
++
++## Установка
++
++```bash
++pip install -r requirements.txt
++```
++
++## Как запустить (один гарантированный путь)
++
++CLI:
++
++```bash
++python tool.py demo.csv --output demo_output.xlsx
++```
++
++Streamlit:
++
++```bash
++streamlit run app.py
++```
++
++## Что считается стабильным, а что экспериментальным
++
++**Стабильные методы (используются по умолчанию в UI):**
++- correlation_full / correlation_partial
++- coherence_full
++- granger_full
++
++**Экспериментальные/чувствительные методы (выключены по умолчанию):**
++- mutinf_full / mutinf_partial (KNN MI/CMI)
++- te_full / te_partial / te_directed
++- ah_full / ah_partial / ah_directed
++
++## Ограничения корректности (важно знать)
++
++- Данные должны быть синхронны по частоте дискретизации (равный шаг по времени).
++- Для лаговых методов нужно достаточно точек: рекомендуется минимум 10–20 точек на лаг.
++- Для устойчивых оценок на практике требуется хотя бы 200–300 наблюдений на ряд.
++
++## Демо-артефакты
++
++- `demo.csv` — входные данные для смоук-теста.
++- `demo_output.xlsx` — готовый пример отчёта, который создаёт CLI.
+diff --git a/app.py b/app.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbaee2e8012d304130ea1048c79e0e2a291e3028
+--- /dev/null
++++ b/app.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++
++"""Minimal Streamlit facade for BigMasterTool."""
++
++from __future__ import annotations
++
++import os
++import tempfile
++from typing import List
++
++import streamlit as st
++
++from tool import (
++    BigMasterTool,
++    EXPERIMENTAL_METHODS,
++    STABLE_METHODS,
++    compute_connectivity_variant,
++    configure_warnings,
++    method_mapping,
++    plot_connectome,
++    plot_heatmap,
++)
++
++
++def _resolve_selected_methods(selected: List[str]) -> List[str]:
++    """Оставляет только методы, которые реально доступны в mapping."""
++    return [m for m in selected if m in method_mapping]
++
++
++def main() -> None:
++    """Запускает Streamlit UI."""
++    st.set_page_config(page_title="Time Series Connectivity Demo", layout="wide")
++    st.title("Time Series Connectivity Demo")
++    st.caption("Загрузите файл и получите базовый отчёт по связям.")
++
++    configure_warnings(quiet=False)
++
++    uploaded_file = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"])
++    col1, col2, col3 = st.columns(3)
++    with col1:
++        lag = st.number_input("Lag", min_value=1, max_value=50, value=1, step=1)
++    with col2:
++        threshold = st.number_input(
++            "Threshold",
++            min_value=0.0,
++            max_value=1.0,
++            value=0.2,
++            step=0.05,
++        )
++    with col3:
++        normalize = st.checkbox("normalize", value=True)
++
++    col4, col5, col6 = st.columns(3)
++    with col4:
++        remove_outliers = st.checkbox("outliers", value=True)
++    with col5:
++        log_transform = st.checkbox("log", value=False)
++    with col6:
++        quiet_warnings = st.checkbox("quiet warnings", value=False)
++
++    method_options = STABLE_METHODS + EXPERIMENTAL_METHODS
++    selected_methods = st.multiselect(
++        "Methods",
++        options=method_options,
++        default=STABLE_METHODS,
++    )
++
++    if any(method in EXPERIMENTAL_METHODS for method in selected_methods):
++        st.warning("Часть выбранных методов помечена как experimental.")
++
++    if st.button("Run", type="primary"):
++        if not uploaded_file:
++            st.error("Сначала загрузите файл CSV/XLSX.")
++            return
++
++        configure_warnings(quiet=quiet_warnings)
++        suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            input_path = os.path.join(tmp_dir, f"input{suffix}")
++            output_path = os.path.join(tmp_dir, "AllMethods_Full.xlsx")
++
++            with open(input_path, "wb") as f:
++                f.write(uploaded_file.getbuffer())
++
++            tool = BigMasterTool(enable_experimental=False)
++            tool.lag_ranges = {v: range(1, lag + 1) for v in method_mapping}
++
++            with st.spinner("Обработка данных..."):
++                tool.load_data_excel(
++                    input_path,
++                    log_transform=log_transform,
++                    remove_outliers=remove_outliers,
++                    normalize=normalize,
++                    fill_missing=True,
++                    check_stationarity=False,
++                )
++                tool.run_all_methods()
++                tool.export_big_excel(
++                    output_path,
++                    threshold=threshold,
++                    window_size=100,
++                    overlap=50,
++                    log_transform=log_transform,
++                    remove_outliers=remove_outliers,
++                    normalize=normalize,
++                    fill_missing=True,
++                    check_stationarity=False,
++                )
++
++            resolved_methods = _resolve_selected_methods(selected_methods)
++            if not resolved_methods:
++                st.info("Методы не выбраны или недоступны.")
++                return
++
++            st.subheader("Heatmaps")
++            for method in resolved_methods[:2]:
++                matrix = compute_connectivity_variant(
++                    tool.data_normalized,
++                    method,
++                    lag=lag,
++                )
++                heatmap = plot_heatmap(
++                    matrix,
++                    f"{method} Heatmap",
++                    legend_text=f"Lag={lag}",
++                )
++                st.image(heatmap, caption=method)
++
++            st.subheader("Connectome")
++            primary_method = resolved_methods[0]
++            matrix = compute_connectivity_variant(
++                tool.data_normalized,
++                primary_method,
++                lag=lag,
++            )
++            directed = "directed" in primary_method or "partial" in primary_method
++            invert = "granger" in primary_method
++            connectome = plot_connectome(
++                matrix,
++                f"{primary_method} Connectome",
++                threshold=threshold,
++                directed=directed,
++                invert_threshold=invert,
++                legend_text=f"Lag={lag}",
++            )
++            st.image(connectome, caption=primary_method)
++
++            with open(output_path, "rb") as f:
++                st.download_button(
++                    "Download Excel",
++                    data=f.read(),
++                    file_name="AllMethods_Full.xlsx",
++                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++                )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/demo.csv b/demo.csv
+new file mode 100644
+index 0000000000000000000000000000000000000000..e422da9e4af5b7588a2a3fd5a61ba41716d594a5
+--- /dev/null
++++ b/demo.csv
+@@ -0,0 +1,120 @@
++0.068884,1.051591,-0.015886
++0.057187,0.996684,0.085803
++0.266393,0.938443,0.200294
++0.328203,1.031860,0.296962
++0.366317,0.963269,0.397592
++0.453907,0.945766,0.531753
++0.654092,0.886335,0.439163
++0.719662,0.818777,0.534664
++0.742266,0.584023,0.483310
++0.835824,0.663962,0.566343
++0.865794,0.565422,0.380644
++0.978445,0.407614,0.267834
++0.998208,0.278722,0.350254
++1.014093,0.096937,0.191581
++1.069255,0.041051,0.056916
++1.074007,-0.074986,0.000304
++0.940675,-0.025012,-0.057049
++0.964522,-0.306432,-0.252931
++0.947631,-0.237476,-0.384746
++0.916871,-0.380641,-0.373062
++0.919985,-0.507107,-0.348775
++0.818654,-0.585111,-0.491915
++0.749309,-0.706411,-0.483781
++0.612019,-0.818657,-0.557393
++0.593124,-0.789918,-0.473273
++0.398793,-0.825294,-0.346243
++0.470406,-0.854120,-0.276244
++0.370951,-0.950010,-0.296087
++0.224806,-1.027846,-0.118295
++0.149014,-0.917858,-0.060909
++0.063556,-0.983713,0.016500
++-0.099568,-0.892049,0.213860
++-0.176705,-1.055431,0.251314
++-0.339213,-0.915653,0.385893
++-0.485277,-0.854671,0.314343
++-0.582340,-0.791301,0.414089
++-0.549933,-0.869872,0.413629
++-0.653434,-0.811921,0.514381
++-0.683098,-0.637071,0.528774
++-0.923370,-0.532679,0.485079
++-0.867895,-0.490971,0.388383
++-0.831519,-0.466240,0.250812
++-0.869619,-0.336669,0.187995
++-1.043198,-0.110609,0.255645
++-1.093266,-0.080828,-0.013892
++-1.047232,-0.016245,-0.010173
++-1.019418,0.080754,-0.142440
++-1.060839,0.168363,-0.142767
++-0.997288,0.320613,-0.280657
++-0.827498,0.529435,-0.465124
++-0.808666,0.630919,-0.541699
++-0.746591,0.692575,-0.519001
++-0.761621,0.721783,-0.511494
++-0.698791,0.767859,-0.508250
++-0.534869,0.837745,-0.496431
++-0.486085,0.956734,-0.456637
++-0.349122,0.834959,-0.288533
++-0.293760,0.874493,-0.295726
++-0.209712,1.078107,-0.185318
++-0.095200,0.970447,0.036679
++0.079525,1.022822,0.095826
++0.135342,0.970365,0.185930
++0.161248,0.903816,0.218783
++0.309125,0.959952,0.312577
++0.532600,0.902832,0.389705
++0.529145,0.876391,0.442365
++0.666195,0.682890,0.479301
++0.663604,0.633962,0.505471
++0.779285,0.635771,0.538561
++0.919969,0.536525,0.415720
++0.888542,0.507548,0.474012
++0.999642,0.286502,0.426861
++0.995332,0.164872,0.285525
++1.086841,0.125053,0.178870
++0.962451,-0.017706,0.083023
++0.898294,-0.001406,-0.060139
++0.904870,-0.246978,-0.138398
++1.036556,-0.317666,-0.167513
++0.847659,-0.302731,-0.367145
++0.799354,-0.514270,-0.423759
++0.887178,-0.487407,-0.537127
++0.769274,-0.613754,-0.523246
++0.767341,-0.765286,-0.595893
++0.521248,-0.753794,-0.472686
++0.615733,-0.762529,-0.365611
++0.342285,-0.851142,-0.350651
++0.367574,-0.899211,-0.236336
++0.263398,-0.997416,-0.221172
++0.073186,-0.973876,-0.228692
++-0.043398,-1.032970,0.031537
++-0.035417,-1.029214,0.102977
++-0.275509,-1.050201,0.277004
++-0.328429,-0.979171,0.284043
++-0.427049,-0.926999,0.303820
++-0.571177,-0.940898,0.426207
++-0.656396,-0.840616,0.434284
++-0.671009,-0.836655,0.576470
++-0.735251,-0.615222,0.594157
++-0.829287,-0.606817,0.520832
++-0.871785,-0.554783,0.488493
++-0.827738,-0.338016,0.407899
++-0.970928,-0.229130,0.334334
++-1.061761,-0.305587,0.266916
++-1.080720,-0.216950,0.096447
++-0.996112,-0.023491,0.010922
++-0.978756,0.128129,-0.107267
++-1.006796,0.294400,-0.240682
++-0.898847,0.285201,-0.313580
++-1.004668,0.470590,-0.324625
++-0.789790,0.482682,-0.393162
++-0.889865,0.560950,-0.531575
++-0.839417,0.753475,-0.553297
++-0.744425,0.678603,-0.522261
++-0.582770,0.736169,-0.379395
++-0.407208,0.793497,-0.454015
++-0.373964,0.987639,-0.374837
++-0.228117,0.914729,-0.296336
++-0.209904,1.011794,-0.264577
++-0.083449,0.938184,-0.136772
++0.092513,1.079802,0.063624
+diff --git a/demo_output.xlsx b/demo_output.xlsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..48a9d643ee0432fa72a96f8307a885a7178a18a3
+--- /dev/null
++++ b/demo_output.xlsx
+GIT binary patch
+literal 1634
+zcmWIWW@Zs#U|`^2XezOd`LKuk-ftk!kcojo7)VDu=jWBA=9R>UR2HNb$Ldw&=4_pG
+z+V8M|fa~|aT&Hhq&6~pNq~R%UGwr~lngb7fgtY5UmU;iEo-?JrMI-6*)f2nEpW7+5
+z^Om36X6DuvbJqTJn=)tO)ODfT*8lwcZr_eax6?x3-m`I?w%6=hjmOD&W*5r|2Q}uX
+z&z^dYwOP~NnP2W{hwVYv$hf8wvx&a0v&uiD9gQgUmVH;6R304G_rk%dsI2(QxgE0>
+ze~<F?iEMAqt#9b!?>KSts4)A}$5zr7bDGXP$~;#7#V}rF#k3p3ZC@JHq!TZFcy;K<
+zqdOY^?tS(Szh3GU^!mxYCmkJj0^14|yxh7|xtdR{`yZP4(LLhWGo9Fd8uMGVBI+DA
+zSFs16gcZN^X`WTUFp^<pVBiMQ@kOaQ#rk?6viJN(z9s_!wg+>UXXH(9YBoG}D9I;+
+z*UmxLUGYNP<*=jMw=b4pKYse}_t<~QduPnFz0f{!O@ons!@|%jy<yxtwmm;9_e#q;
+zu3(y>>mh?(2QKyUGPOzEZT!4|&BW-*lMBmy{qLQa;kJI~<g7_jKeuU=-Km!fNbOl0
+zajk@@=JM17x27MiuXy!4@L}hby9;{l_tmIQ(%E}VBVp#x$$v_eXMJj6@|XR&DrM?k
+zMpQ4oF0ggl3-pRI&`bP4x*|uvJijPADL+3O6!pFSyYmhk@Z9+;%Je<LuYG|*PC6%7
+zir+8BRldiad@d?HwfVQNsi{OyUGC)W$ELs8&pvBgG|!p)_9mw0h0hPRdvo7^zW%KG
+zo860cZjPy+v0iO1dv0P^;mWmF>zs<BJ~b)kx``DTI_`{!Wx2aRIBChvx{#~qCVgh)
+z`Wzm)dfNXLA1!{#@!whBqPXt~OS<^w+g3ka7kVG^-F8{8dQSsq--g!9UQeEIs`2+b
+zcX7F8&6l#|i{3CZ@BW`-`<Tm*>ZAI!=JuJYbwD4=0(~k4@hK$!ko^mZ%l@-m%?1K3
+z@9kV~RL8zuI3?*z5LaAxZG%9#@D&x6m-la*e+kg~a^bR(_2&CVp`Rnt%9Q1|n97{m
+z!{Fw2D{l70!%MAmzg@TzS-LFphzO_GZeVP3%7pa1Ymiv7$hGB;mC;GbHSsP!m-=6{
+z%sJw*L$^!zS3cVn$z*Mv>}tM!Z@m-lUcP8wVa*eD>Efx^PHO*tG?l+zzMvziiOW9d
+z$%jbRntmhykOLt?;kvKiu%i0XLAW%K3FyN_V0M;3#Ak6vYHCTbKA18DN9?4tpgi63
+zzLM*-x`n{<l`UFNb})tBu@K#%bo!>5*uTze(p>rd!747@LSHQ&&%Nm%b^7b_@;A%|
+zHzlO@X=tBQm~rFQhWsC=KR-U(wLVmlU+{h~yMxa8_A4LyR_qs6n#s4vFZGS$lj*T8
+z>ovXabYD?^@lE2B-<8l(?LFHXS2r0}ZZV(rWyPjr6$vxGf0mysYy9drYx<P}={dX`
+zRG)a=TB5S@?Ss9?^ff&^4WkatQIlUbN&3UYqm92BZ-l<z(x|sf?8C46=^~P^MK;*6
+zuTj5d!&tg;?!(z!`?AarxayoPp7zvbX=ld+lc&P_-?BYVTd_=QRZ-}92hWes7X<zJ
+zCl*@69N^8!B*KilAOr>;7&HJw6Kk=EZUB1e0MX9C(7>nzGy<utK-Y+#2N4?o12v-M
+yNOaBU$r_>gB`^s9HRDL+=;oj&9E3UNnc<GWNJatPtZX2atU%}rbSyh7hz9_=vywvq
+
+literal 0
+HcmV?d00001
+
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..538e0bffdc303f00e9a0c08d25da9a1f60b3d39e
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,13 @@
++matplotlib==3.8.4
++networkx==3.3
++nolds==0.5.2
++numpy==1.26.4
++openpyxl==3.1.5
++pandas==2.2.2
++pyinform==0.2.0
++scikit-learn==1.5.1
++scipy==1.13.1
++statsmodels==0.14.2
++streamlit==1.37.0
++tqdm==4.66.4
++hurst==0.0.5
+diff --git a/hueta.py b/tool.py
+similarity index 92%
+rename from hueta.py
+rename to tool.py
+index 10587cec1715038926dd83bec08dea4d3faede4a..44f14426eb63c99f640a66deb01fa291d7fe0fe0 100644
+--- a/hueta.py
++++ b/tool.py
+@@ -1,91 +1,115 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ 
+-import os
++import argparse
+ import logging
+-from typing import List
++import os
+ import warnings
+-import numpy as np
+-import pandas as pd
++from io import BytesIO
++from itertools import chain, combinations, permutations
+ from typing import List, Optional
++
+ import matplotlib
+ matplotlib.use('Agg')
+ import matplotlib.pyplot as plt
+ import networkx as nx
+-from io import BytesIO
++import nolds
++import numpy as np
++import pandas as pd
++import pyinform
++import scipy.signal as signal
++from hurst import compute_Hc
+ from openpyxl import Workbook
+ from openpyxl.drawing.image import Image
+-from openpyxl.utils.dataframe import dataframe_to_rows
+ from openpyxl.styles import PatternFill
+ from openpyxl.utils import get_column_letter
+-from tqdm import tqdm
+-import pyinform
+-from statsmodels.tsa.stattools import grangercausalitytests, adfuller
+-from statsmodels.tsa.vector_ar.var_model import VAR
+-from scipy.signal import coherence, find_peaks
+-from scipy.fft import fft
++from openpyxl.utils.dataframe import dataframe_to_rows
+ from scipy import stats
+-from sklearn.metrics import mutual_info_score
++from scipy.fft import fft
++from scipy.signal import coherence, find_peaks
++from scipy.spatial import cKDTree
++from scipy.special import digamma
+ from sklearn.linear_model import LinearRegression
+ from sklearn.preprocessing import StandardScaler
+-from hurst import compute_Hc
+-import nolds
+ from statsmodels.graphics.tsaplots import plot_acf
+-from itertools import chain, combinations, permutations
+-import scipy.signal as signal
+-from scipy.special import digamma
+-from scipy.spatial import cKDTree
+-import sys
+-import argparse
+-from math import log, isnan, sqrt, floor, ceil
++from statsmodels.tsa.stattools import adfuller, grangercausalitytests
++from statsmodels.tsa.vector_ar.var_model import VAR
++from tqdm import tqdm
+ 
+ 
+-# Подавление предупреждений
+-warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels.tsa.stattools")
+-warnings.filterwarnings("ignore", message="nperseg = 256 is greater than input length")
+-warnings.filterwarnings("ignore")
++def configure_warnings(quiet: bool = False) -> None:
++    """Настраивает предупреждения без глобального подавления."""
++    warnings.filterwarnings(
++        "ignore",
++        category=FutureWarning,
++        module="statsmodels.tsa.stattools",
++    )
++    warnings.filterwarnings(
++        "ignore",
++        message="nperseg = 256 is greater than input length",
++    )
++    if quiet:
++        warnings.filterwarnings("ignore")
+ 
+ 
+ base_path = os.path.dirname(os.path.abspath(__file__))
+ save_folder = os.path.join(base_path, "TimeSeriesAnalysis")
+ os.makedirs(save_folder, exist_ok=True)
+ 
+ # Параметр регуляризации для избежания вырождения
+ REG_ALPHA = 1e-5
+ 
+ ##############################################
+ # Настройки по умолчанию
+ ##############################################
+ DEFAULT_MAX_LAG = 5
+ DEFAULT_K_MI = 5
+ DEFAULT_BINS = 8
+ DEFAULT_OUTLIER_Z = 5
+ DEFAULT_REGULARIZATION = 1e-8
+ DEFAULT_EMBED_DIM = 3
+ DEFAULT_EMBED_TAU = 1
+ 
++STABLE_METHODS = [
++    "correlation_full",
++    "correlation_partial",
++    "coherence_full",
++    "granger_full",
++]
++
++EXPERIMENTAL_METHODS = [
++    "mutinf_full",
++    "mutinf_partial",
++    "te_full",
++    "te_partial",
++    "te_directed",
++    "ah_full",
++    "ah_partial",
++    "ah_directed",
++]
++
+ ##############################################
+ # Предобработка и загрузка
+ ##############################################
+ def additional_preprocessing(df: pd.DataFrame, unique_thresh: float = 0.05) -> pd.DataFrame:
+     df = df.copy()
+     for col in df.columns:
+         if len(df[col]) > 0 and pd.api.types.is_numeric_dtype(df[col]):
+             uniq_ratio = df[col].nunique() / len(df[col])
+             if uniq_ratio < unique_thresh:
+                 logging.info(f"[Preproc] Столбец {col} почти константный (uniq_ratio={uniq_ratio:.3f}), удаляем.")
+                 df.drop(columns=[col], inplace=True)
+     for col in df.columns:
+          if pd.api.types.is_numeric_dtype(df[col]) and (df[col] > 0).all():
+             skew_before = stats.skew(df[col].dropna())
+             if not np.isnan(skew_before):
+                 transformed = np.log(df[col])
+                 skew_after = stats.skew(transformed.dropna())
+                 if not np.isnan(skew_after) and abs(skew_after) < abs(skew_before):
+                     logging.info(f"[Preproc] Лог-преобразование для {col}: skew {skew_before:.3f} -> {skew_after:.3f}.")
+                     df[col] = transformed
+     return df
+ 
+ def load_or_generate(filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
+     try:
+         if filepath.lower().endswith(".csv"):
+@@ -144,50 +168,56 @@ def load_or_generate(filepath: str, log_transform=False, remove_outliers=True, n
+ def correlation_matrix(data: pd.DataFrame, **kwargs) -> np.ndarray:
+     return data.corr().values
+ 
+ def partial_correlation_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
+     cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+     n = len(cols)
+     out = np.eye(n)
+     for i in range(n):
+         for j in range(i + 1, n):
+             xi, xj = cols[i], cols[j]
+             ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
+             sub_cols = [xi, xj] + [c for c in ctrl_vars if c in cols and c not in (xi, xj)]
+             sub = df[sub_cols].dropna()
+             if sub.shape[0] < len(sub_cols) + 1:
+                 pcor = np.nan
+             else:
+                 try:
+                     R = sub.corr().values
+                     P = np.linalg.pinv(R)
+                     pcor = -P[0, 1] / np.sqrt(P[0, 0] * P[1, 1])
+                 except Exception:
+                     pcor = np.nan
+             out[i, j] = out[j, i] = pcor
+     return out
+ 
++
++def partial_h2_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
++    """Возвращает квадрат частичной корреляции (H^2) для заданного контроля."""
++    pcor = partial_correlation_matrix(df, control=control, **kwargs)
++    return pcor**2
++
+ def lagged_directed_correlation(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
+     m = df.shape[1]
+     out = np.zeros((m, m))
+     for i in range(m):
+         for j in range(m):
+             if i == j or len(df) <= lag: continue
+             s1, s2 = df.iloc[:-lag, i].values, df.iloc[lag:, j].values
+             if len(s1) > 1:
+                 out[i, j] = np.corrcoef(s1, s2)[0, 1]
+     return out
+ 
+ def h2_matrix(df: pd.DataFrame, **kwargs) -> np.ndarray: return correlation_matrix(df)**2
+ def lagged_directed_h2(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray: return lagged_directed_correlation(df, lag)**2
+ 
+ def coherence_matrix(data: pd.DataFrame, **kwargs):
+     N = data.shape[1]
+     coh = np.zeros((N,N))
+     for i in range(N):
+         for j in range(i+1, N):
+             s1, s2 = data.iloc[:,i].dropna(), data.iloc[:,j].dropna()
+             if len(s1) > 1 and len(s2) > 1:
+                 try:
+                     nperseg = min(256, min(len(s1), len(s2)))
+                     f, Cxy = signal.coherence(s1, s2, nperseg=nperseg)
+                     coh[i,j] = coh[j,i] = float(np.nanmean(Cxy))
+@@ -804,64 +834,65 @@ def plot_coherence_vs_frequency(series1: pd.Series, series2: pd.Series, title: s
+     freqs, cxy = coherence(s1, s2, fs=fs)
+     fig, ax = plt.subplots(figsize=(6, 4))
+     ax.plot(freqs, cxy, label="Когерентность")
+     if cxy.size > 0:
+         max_idx = np.argmax(cxy)
+         max_freq = freqs[max_idx]
+         max_coh = cxy[max_idx]
+         ax.plot(max_freq, max_coh, "ro", label=f"Макс. связь: {max_coh:.3f} на {max_freq:.3f}Hz")
+         ax.annotate(f"{max_freq:.3f} Hz", xy=(max_freq, max_coh), xytext=(max_freq, max_coh+0.05),
+                     arrowprops=dict(facecolor='black', shrink=0.05))
+     ax.set_title(title)
+     ax.set_xlabel("Частота (Hz)")
+     ax.set_ylabel("Когерентность")
+     ax.legend()
+     buf = BytesIO()
+     plt.tight_layout()
+     plt.savefig(buf, format="png")
+     buf.seek(0)
+     plt.close(fig)
+     return buf
+ 
+ ##############################################
+ # Функции для экспорта данных в Excel
+ ##############################################
+ def add_raw_data_sheet(wb: Workbook, df: pd.DataFrame) -> None:
+-    ws = wb.create_sheet("All Synthetic Data")
++    """Добавляет лист с исходными данными."""
++    ws = wb.create_sheet("Raw Data")
+     ws.append(list(df.columns))
+     for _, row in df.iterrows():
+         ws.append(list(row))
+ 
+ def plot_heatmap(matrix: np.ndarray, title: str, legend_text: str = "", annotate: bool = False, vmin=None, vmax=None) -> BytesIO:
+     fig, ax = plt.subplots(figsize=(4, 3.2))
+     
+     if matrix is None or not isinstance(matrix, np.ndarray) or matrix.size == 0:
+         ax.text(0.5, 0.5, "Error\n(No Data)", ha='center', va='center', color='red', fontsize=12)
+         ax.set_xticks([])
+         ax.set_yticks([])
+     else:
+-        # шоб матплолиб сам не подобрал
++        # Фиксируем шкалу, чтобы избежать авто-нормализации matplotlib.
+         cax = ax.imshow(matrix, cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+         fig.colorbar(cax, ax=ax)
+         ax.set_title(title, fontsize=10)
+         
+         # Аннотации
+         if annotate and matrix.shape[0] < 10:
+             min_val = vmin if vmin is not None else np.nanmin(matrix)
+             max_val = vmax if vmax is not None else np.nanmax(matrix)
+             
+             if np.isfinite(min_val) and np.isfinite(max_val) and max_val > min_val:
+                 threshold = min_val + (max_val - min_val) / 2.0
+             else:
+                 threshold = 0.5 # запасной вариант
+ 
+             for i in range(matrix.shape[0]):
+                 for j in range(matrix.shape[1]):
+                     val = matrix[i, j]
+                     if np.isnan(val):
+                         display_val, color = "NaN", "red"
+                     else:
+                         display_val = f"{val:.2f}"
+                         # Цвет текста зависит от порога, который выч отдельно. от 0,5 НЕ ВОЗВРАЩАТЬ
+                         color = "white" if val < threshold else "black"
+                     ax.text(j, i, display_val, ha="center", va="center", color=color, fontsize=8)
+ 
+@@ -916,90 +947,70 @@ def add_method_to_sheet(ws, row: int, title: str, matrix: np.ndarray, directed:
+         ws.append(["Метод не работает для этих данных."])
+         return ws.max_row
+     df_mat = pd.DataFrame(matrix)
+     for r in dataframe_to_rows(df_mat, index=False, header=True):
+         ws.append(r)
+     buf_heat = plot_heatmap(matrix, title + " Heatmap", legend_text=legend_text)
+     img_heat = Image(buf_heat)
+     img_heat.width = 400
+     img_heat.height = 300
+     ws.add_image(img_heat, f"A{ws.max_row + 2}")
+     buf_conn = plot_connectome(matrix, title + " Connectome", threshold=0.2, directed=directed, invert_threshold=False, legend_text=legend_text)
+     img_conn = Image(buf_conn)
+     img_conn.width = 400
+     img_conn.height = 400
+     ws.add_image(img_conn, f"G{ws.max_row + 2}")
+     return ws.max_row
+ 
+ def fmt_val(v):
+     try:
+         f = float(v)
+         if np.isnan(f):
+             return "N/A"
+         return f"{f:.3f}"
+     except Exception:
+         return "N/A"
+-raw_data = None 
+-
+-
+-
+-####
++# 
+ # МАППИНГ
+ ###
+ method_mapping = {
+     # ——— Correlation ———
+     "correlation_full":     lambda data, lag=None, control=None: correlation_matrix(data),
+     "correlation_partial":  lambda data, lag=None, control=None: partial_correlation_matrix(data, control),
+-    "correlation_directed": lambda data, lag, control=None:
+-                                (lagged_directed_correlation(data, lag)
+-                                 if not control
+-                                 else partial_directed_correlation(data, lag, control)), 
++    "correlation_directed": lambda data, lag, control=None: lagged_directed_correlation(data, lag),
+ 
+     # ——— H² (squared corr) ———
+     "h2_full":              lambda data, lag=None, control=None: correlation_matrix(data)**2,
+     "h2_partial":           lambda data, lag=None, control=None: partial_h2_matrix(data, control), 
+-    "h2_directed":          lambda data, lag, control=None:
+-                                (lagged_directed_h2(data, lag)
+-                                 if not control
+-                                 else partial_directed_h2(data, lag, control)), 
++    "h2_directed":          lambda data, lag, control=None: lagged_directed_h2(data, lag),
+ 
+     # ——— Mutual Information ———
+-    "mutinf_full":          lambda data, lag=0, control=None: mutual_info_matrix(data, lag),
+-    "mutinf_partial":       lambda data, lag=0, control=None: mutual_info_matrix_partial(data, control),
+-    "mutinf_directed":      lambda data, lag, control=None:
+-                                (lagged_directed_mutual_info(data, lag) 
+-                                 if not control
+-                                 else partial_directed_mutinf(data, lag, control)), 
++    "mutinf_full":          lambda data, lag=0, control=None: mutual_info_matrix(data, k=DEFAULT_K_MI),
++    "mutinf_partial":       lambda data, lag=0, control=None: mutual_info_matrix_partial(data, control, k=DEFAULT_K_MI),
+ 
+     # ——— Coherence ———
+     "coherence_full":       lambda data, lag=None, control=None: coherence_matrix(data),
+-    "coherence_partial":    lambda data, lag=None, control=None: coherence_matrix_partial(data, control), 
+-    "coherence_directed": lambda data, lag, control=None: (
+-        lagged_directed_coherence(data, lag) 
+-        if not control
+-        else partial_directed_coherence(data, lag, control) 
+-    ),
+ 
+ 
+ # ...
+     # ——— Granger causality ———
+     "granger_full":         lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
+     "granger_partial":      lambda data, lag, control=None: compute_partial_granger_matrix(data, lags=lag), 
+     "granger_directed":     lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
+ # ...
+ 
+     # ——— Transfer entropy ———
+     "te_full":    lambda data, lag, control=None: TE_matrix(data, lag=lag),
+     "te_partial": lambda data, lag, control=None: TE_matrix_partial(data, lag=lag, control=control, bins=DEFAULT_BINS),
+     "te_directed":lambda data, lag, control=None: TE_matrix_partial(data, lag=lag, control=control, bins=DEFAULT_BINS),
+ 
+ 
+     # ——— AH (non‑linear) ———
+     "ah_full":              lambda data, lag=None, control=None: AH_matrix(data),
+     "ah_partial":           lambda data, lag, control=None: compute_partial_AH_matrix(data, max_lag=lag, control=control),
+     "ah_directed":          lambda data, lag, control=None:
+                                 (AH_matrix(data)
+                                  if not control
+                                  else compute_partial_AH_matrix(data, max_lag=lag, control=control)),
+ }
+ 
+ def compute_connectivity_variant(data, variant, lag=1, control=None):
+@@ -1030,59 +1041,74 @@ def regression_diagnostics(df: pd.DataFrame, target: str, controls: list):
+     """
+     # Если нет контрольных переменных — выходим
+     if not controls:
+         return f"Нет контрольных переменных для {target}."
+     # Иначе строим модель и возвращаем R²
+     X = df[controls]
+     y = df[target]
+     model = LinearRegression().fit(X, y)
+     r2 = model.score(X, y)
+     return f"{target} ~ {controls}: R² = {r2:.3f}"
+ 
+ 
+ ##############################################
+ # Частотный анализ: возвращает пиковые значения
+ ##############################################
+ def frequency_analysis(series: pd.Series, peak_height_ratio: float = 0.2):
+     freqs, amplitude, phase, peaks = plt_fft_analysis(series)
+     if freqs.size == 0 or peaks.size == 0:
+         return None, None, None
+     peak_freqs = freqs[peaks]
+     peak_amps = amplitude[peaks]
+     periods = 1 / peak_freqs
+     return peak_freqs, peak_amps, periods
+ 
+ def sliding_fft_analysis(data: pd.DataFrame, window_size: int, overlap: int) -> dict:
+-    logging.warning("sliding_fft_analysis is a placeholder. Implement actual logic if needed.")
++    """Экспериментальный анализ скользящего FFT (по умолчанию отключён)."""
++    logging.info("[Sliding FFT] Экспериментальная функция отключена.")
+     return {}
+ 
+-def analyze_sliding_windows_with_metric(data: pd.DataFrame, variant: str, window_size: int, overlap: int) -> dict:
+-    logging.warning(f"analyze_sliding_windows_with_metric for {variant} is a placeholder. Implement actual logic if needed.")
++
++def analyze_sliding_windows_with_metric(
++    data: pd.DataFrame,
++    variant: str,
++    window_size: int,
++    overlap: int,
++) -> dict:
++    """Экспериментальный анализ скользящих окон (по умолчанию отключён)."""
++    logging.info("[Sliding Window] Экспериментальная функция отключена.")
+     return {}
+ 
+-def sliding_window_pairwise_analysis(data: pd.DataFrame, method: str, window_size: int, overlap: int) -> dict:
+-    logging.warning(f"sliding_window_pairwise_analysis for {method} is a placeholder. Implement actual logic if needed.")
++
++def sliding_window_pairwise_analysis(
++    data: pd.DataFrame,
++    method: str,
++    window_size: int,
++    overlap: int,
++) -> dict:
++    """Экспериментальный парный анализ скользящих окон (по умолчанию отключён)."""
++    logging.info("[Sliding Pairwise] Экспериментальная функция отключена.")
+     return {}
+ 
+ ##############################################
+ # Листы с коэффициентами и частотным анализом
+ ##############################################
+ def export_coefficients_sheet(tool, wb: Workbook):
+     ws = wb.create_sheet("Coefficients & Explanations")
+     ws.append(["Описание:", "Лист содержит краткие пояснения коэффициентов регрессий и матриц связей."])
+     ws.append(["Например, коэффициенты регрессии показывают, как контрольные переменные влияют на связь между переменными."])
+     ws.append([])
+     ws.append(["Регрессионная диагностика:"])
+     ws.append(["Переменная", "Контроль", "Диагностика"])
+     for target in tool.data.columns:
+         controls = [c for c in tool.data.columns if c != target]
+         diag_str = regression_diagnostics(tool.data, target, controls)
+         ws.append([target, str(controls), diag_str])
+     ws.append([])
+     ws.append(["Матрицы связей:"])
+     ws.append(["Метод", "Описание"])
+     methods_info = [
+         ("correlation_full", "Стандартная корреляционная матрица."),
+         ("correlation_partial", "Частичная корреляция (с контролем)."),
+         ("mutinf_full", "Полная взаимная информация."),
+         ("coherence_full", "Когерентность между переменными.")
+     ]
+@@ -1137,58 +1163,66 @@ def export_entropy_sheet(tool, wb: Workbook):
+     ws.append(["Столбец", "Sample Entropy (sampen)"])
+     for col in tool.data.columns:
+         s = tool.data[col].dropna()
+         ent = compute_sample_entropy(s)
+         ws.append([col, f"{ent:.3f}" if not np.isnan(ent) else "N/A"])
+     logging.info("[Entropy Analysis] Лист сформирован.")
+ 
+ ##############################################
+ # Новый лист
+ ##############################################
+ def export_combined_informational_sheet(tool, wb: Workbook):
+     ws = wb.create_sheet("Combined Informational Analysis")
+     current_row = 1
+     ws.cell(row=current_row, column=1, value="Combined Informational Analysis")
+     current_row += 2
+     ws.cell(row=current_row, column=1, value="Lag Analysis Summary (Aggregated)")
+     current_row += 1
+     buf_lag = tool.plot_all_methods_lag_comparison(tool.lag_results)
+     img_lag = Image(buf_lag)
+     img_lag.width = 800
+     img_lag.height = 600
+     ws.add_image(img_lag, f"A{current_row}")
+     current_row += 30
+     ws.cell(row=current_row, column=1, value="Sliding Window Analysis Summary (Aggregated)")
+     current_row += 1
+-    sw_res = tool.analyze_sliding_windows("coherence_full", window_size=min(50, len(tool.data_normalized)//2), overlap=min(25, len(tool.data_normalized)//4))
+-    legend_text = "Метод: coherence_full, Окно: 50"
+-    buf_sw = tool.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
+-    img_sw = Image(buf_sw)
+-    img_sw.width = 700
+-    img_sw.height = 400
+-    ws.add_image(img_sw, f"A{current_row}")
+-    current_row += 20
++    sw_res = tool.analyze_sliding_windows(
++        "coherence_full",
++        window_size=min(50, len(tool.data_normalized) // 2),
++        overlap=min(25, len(tool.data_normalized) // 4),
++    )
++    if sw_res:
++        legend_text = "Метод: coherence_full, Окно: 50"
++        buf_sw = tool.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
++        img_sw = Image(buf_sw)
++        img_sw.width = 700
++        img_sw.height = 400
++        ws.add_image(img_sw, f"A{current_row}")
++        current_row += 20
++    else:
++        ws.append(["Sliding Window Analysis отключён или нет данных."])
++        current_row += 2
+     ws.cell(row=current_row, column=1, value="Pairwise Lag Analysis (пример для первой пары)")
+     current_row += 1
+     if len(tool.data.columns) >= 2:
+         pair = list(combinations(tool.data.columns, 2))[0]
+         col1, col2 = pair
+         series1 = tool.data[col1].dropna().values
+         series2 = tool.data[col2].dropna().values
+         n = min(len(series1), len(series2))
+         lag_metrics = {}
+         for lag in range(1, 21):
+             if n > lag:
+                 corr = np.corrcoef(series1[lag:], series2[:n-lag])[0, 1] if len(series1[lag:]) > 1 and len(series2[:n-lag]) > 1 else np.nan
+                 lag_metrics[lag] = corr
+         if lag_metrics:
+             lags = list(lag_metrics.keys())
+             correlations = [lag_metrics[lag] for lag in lags]
+             fig, ax = plt.subplots(figsize=(4, 3))
+             ax.plot(lags, correlations, marker='o')
+             ax.set_title(f"Lag Analysis: {col1}-{col2}")
+             legend_text_pair = f"Пара: {col1}-{col2}, Метод: Lag Correlation"
+             ax.text(0.5, 0.1, legend_text_pair, transform=ax.transAxes, fontsize=8, 
+                     verticalalignment='bottom', bbox=dict(facecolor='white', alpha=0.5))
+             buf_plag = BytesIO()
+             plt.tight_layout()
+             plt.savefig(buf_plag, format="png", dpi=100)
+@@ -1298,73 +1332,91 @@ def export_all_fft_sheet(tool, wb: Workbook):
+     logging.info("[Combined FFT] Лист сформирован.")
+ 
+ ##############################################
+ # Создание оглавления с гиперссылками
+ ##############################################
+ def create_table_of_contents(wb: Workbook):
+     if "Table of Contents" in wb.sheetnames:
+         old_sheet = wb["Table of Contents"]
+         wb.remove(old_sheet)
+     toc = wb.create_sheet("Table of Contents", 0)
+     row = 1
+     for sheet_name in wb.sheetnames:
+         if sheet_name == "Table of Contents":
+             continue
+         link = f"#{sheet_name}!A1"
+         cell = toc.cell(row=row, column=1)
+         cell.value = sheet_name
+         cell.hyperlink = link
+         cell.style = "Hyperlink"
+         row += 1
+ 
+ ##############################################
+ # Класс BigMasterTool 
+ ##############################################
+ class BigMasterTool:
+-    def __init__(self, data: pd.DataFrame = None) -> None:
++    def __init__(self, data: pd.DataFrame = None, enable_experimental: bool = False) -> None:
+         if data is not None:
+             data = data.loc[:, (data != data.iloc[0]).any()]
+             
+             self.data = data.copy()
+             # Гарантируем, что колонки называются c1, c2, ... и нет служебных
+             numeric_cols = [c for c in self.data.columns if pd.api.types.is_numeric_dtype(self.data[c])] # ИСПРАВЛЕНИЕ ЗДЕСЬ
+             self.data = self.data[numeric_cols]
+             self.data.columns = [f'c{i+1}' for i in range(self.data.shape[1])]
+         else:
+             self.data = pd.DataFrame()
+ 
+         self.data_normalized: pd.DataFrame = pd.DataFrame()
+         self.results: dict = {}
+         self.lag_results: dict = {}
+         self.fft_results: dict = {}
+         self.data_type: str = 'unknown'
++        self.enable_experimental = enable_experimental
+         self.lag_ranges = {v: range(1, 21) for v in method_mapping}
+-        self.undirected_methods = ["correlation_full", "correlation_partial", "h2_full", "h2_partial",
+-                                   "mutinf_full", "mutinf_partial", "coherence_full", "coherence_partial"]
+-        self.directed_methods = ["correlation_directed", "h2_directed", "mutinf_directed", "coherence_directed",
+-                                 "granger_full", "granger_partial", "granger_directed", "te_full",
+-                                 "te_partial", "te_directed", "ah_full", "ah_partial", "ah_directed"]
++        self.undirected_methods = [
++            "correlation_full",
++            "correlation_partial",
++            "h2_full",
++            "h2_partial",
++            "mutinf_full",
++            "mutinf_partial",
++            "coherence_full",
++        ]
++        self.directed_methods = [
++            "correlation_directed",
++            "h2_directed",
++            "granger_full",
++            "granger_partial",
++            "granger_directed",
++            "te_full",
++            "te_partial",
++            "te_directed",
++            "ah_full",
++            "ah_partial",
++            "ah_directed",
++        ]
+ 
+     def load_data_excel(self, filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
+         self.data = load_or_generate(filepath, log_transform, remove_outliers, normalize, fill_missing, check_stationarity)
+         self.raw_data = self.data.copy()
+         self.data_normalized = self.data.copy() # Инициализируем data_normalized СРАЗУ после загрузки
+         if self.data.shape[0] < self.data.shape[1]:
+             self.data = self.data.T
+             self.data.columns = [f'c{i+1}' for i in range(self.data.shape[1])] 
+         self.data = self.data.fillna(self.data.mean())
+         self.data_type = 'file'
+         logging.info(f"[BigMasterTool] Данные загружены, shape = {self.data.shape}.")
+         return self.data
+ 
+     def normalize_data(self):
+         if self.data is None or self.data.empty or self.data.shape[1] == 0:
+             logging.warning("[BigMasterTool] normalize_data: нет данных для нормализации.")
+             self.data_normalized = pd.DataFrame()
+             return
+ 
+         cols_to_norm = [c for c in self.data.columns if pd.api.types.is_numeric_dtype(self.data[c])]
+         if not cols_to_norm:
+             self.data_normalized = self.data.copy() 
+             logging.warning("[BigMasterTool] normalize_data: нет числовых колонок для нормализации.")
+             return
+ 
+@@ -1458,82 +1510,99 @@ class BigMasterTool:
+         for pair in self.directed_pairs:
+             others = [c for c in self.data.columns if c not in pair]
+             for S in (list(s) for s in powerset(others)):
+                 self.directed_rows.append((pair, S))
+         logging.info("[Pairs] Пары сформированы.")
+ 
+     def get_undirected_value(self, mat, var1, var2, indices):
+         if mat is None: return np.nan
+         i, j = indices[var1], indices[var2]
+         return mat[min(i, j), max(i, j)]
+ 
+     def get_directed_value(self, mat, src, tgt, indices):
+         if mat is None: return np.nan
+         i, j = indices[src], indices[tgt]
+         return mat[i, j]
+ 
+ 
+     def run_all_methods(self) -> None:
+         self.normalize_data()
+         if self.data_normalized.empty:
+             logging.warning("[RunAll] Нет данных для выполнения анализа.")
+             return
+ 
+         self.results = {}
+         self.lag_results = {}
+-        self.fft_results = sliding_fft_analysis(self.data_normalized, window_size=min(200, len(self.data_normalized)//2), overlap=min(100, len(self.data_normalized)//4))
++        if self.enable_experimental:
++            self.fft_results = sliding_fft_analysis(
++                self.data_normalized,
++                window_size=min(200, len(self.data_normalized) // 2),
++                overlap=min(100, len(self.data_normalized) // 4),
++            )
++        else:
++            self.fft_results = {}
+         
+         # база, лаг 1
+         for variant in method_mapping.keys():
+             self.results[variant] = compute_connectivity_variant(self.data_normalized.copy(), variant, lag=1)
+         
+         # оптимиз лаг для директед
+         directed_methods_for_lag_analysis = [
+-            "correlation_directed", "h2_directed", "mutinf_directed", "coherence_directed",
+-            "granger_full", "granger_partial", "granger_directed", # грейндж -- директед
+-            "te_full", "te_partial", "te_directed",
+-            "ah_full", "ah_partial", "ah_directed"
++            "correlation_directed",
++            "h2_directed",
++            "granger_full",
++            "granger_partial",
++            "granger_directed",
++            "te_full",
++            "te_partial",
++            "te_directed",
++            "ah_full",
++            "ah_partial",
++            "ah_directed",
+         ]
+         for variant in directed_methods_for_lag_analysis:
+             if variant in method_mapping: # d
+                  self.lag_results[variant] = self.analyze_lags(variant, self.lag_ranges.get(variant, range(1, 21)))
+             else:
+                 logging.warning(f"[RunAll] Метод {variant} не найден в method_mapping, пропуск анализа лагов.")
+ 
+         self.compute_all_matrices()
+         self.prepare_pairs()
+         logging.info("[RunAll] Все методы завершены.")
+ 
+     def analyze_sliding_windows(self, variant: str, window_size: int = 100, overlap: int = 50, threshold: float = 0.2) -> dict:
+-        if self.data_normalized.empty: return {}
+-        #
++        if self.data_normalized.empty:
++            return {}
++        if not self.enable_experimental:
++            return {}
+         actual_window_size = min(window_size, len(self.data_normalized))
+         actual_overlap = min(overlap, actual_window_size // 2) 
+         return analyze_sliding_windows_with_metric(self.data_normalized, variant, actual_window_size, actual_overlap)
+ 
+     def sliding_window_pairwise_analysis(self, method: str, window_size: int = 50, overlap: int = 25) -> dict:
+-        if self.data_normalized.empty: return {}
++        if self.data_normalized.empty or not self.enable_experimental:
++            return {}
+         actual_window_size = min(window_size, len(self.data_normalized))
+         actual_overlap = min(overlap, actual_window_size // 2)
+         return sliding_window_pairwise_analysis(self.data_normalized, method, actual_window_size, actual_overlap)
+ 
+     def plot_lag_metrics(self, variant: str, lag_results: dict, legend_text: str = "") -> BytesIO:
+         valid = [(l, lag_results[l][0]) for l in sorted(lag_results.keys()) if not np.isnan(lag_results[l][0])]
+         if not valid:
+             return BytesIO()
+         lags, metrics = zip(*valid)
+         fig, ax = plt.subplots(figsize=(6, 4))
+         ax.plot(lags, metrics, marker='o', linestyle='-', color='b', label=legend_text)
+         ax.set_title(f"Lag Metrics for {variant.upper()} (используемые лаги: {min(lags)}-{max(lags)})")
+         ax.set_xlabel("Lag")
+         ax.set_ylabel("Metric")
+         ax.grid(True)
+         ax.legend()
+         buf = BytesIO()
+         plt.tight_layout()
+         plt.savefig(buf, format="png", dpi=100)
+         buf.seek(0)
+         plt.close(fig)
+         return buf
+ 
+     def plot_sliding_window_comparison(self, sw_results: dict, legend_text: str = "") -> BytesIO:
+         if not sw_results: return BytesIO()
+@@ -1577,51 +1646,51 @@ class BigMasterTool:
+     def assess_significance(self,
+                         method: str,
+                         n_permutations: int = 100,
+                         alpha: float = 0.05):
+  
+         orig = compute_connectivity_variant(self.data_normalized.copy(), method, lag=1)
+         if orig is None or orig.shape[0] < 2:
+             return None, None
+ 
+         n = orig.shape[0]
+         idx_i, idx_j = np.triu_indices(n, k=1)
+         n_pairs = len(idx_i)
+         
+         perm_vals = np.zeros((n_permutations, n_pairs), dtype=float)
+ 
+         for k in range(n_permutations):
+             permuted = self.data_normalized.apply(np.random.permutation, axis=0)
+             pm = compute_connectivity_variant(permuted.copy(), method, lag=1)
+             if pm is None or pm.shape != orig.shape:
+                 perm_vals[k, :] = np.nan
+             else:
+                 perm_vals[k, :] = np.abs(pm[idx_i, idx_j])
+ 
+         orig_vals = np.abs(orig[idx_i, idx_j])
+         
+-        # здесь могут юбыть наны
++        # Здесь могут быть NaN.
+         if np.any(np.isnan(orig_vals)) or n_permutations == 0:
+             p_matrix = np.full_like(orig, np.nan)
+             sig = np.full_like(orig, False, dtype=bool)
+             return sig, p_matrix
+ 
+         p_vals = (
+             (perm_vals >= orig_vals[None, :]).sum(axis=0) + 1
+         ) / (n_permutations + 1)
+ 
+         sig = np.zeros_like(orig, dtype=bool)
+         for (i,j), p in zip(zip(idx_i, idx_j), p_vals):
+             sig[i, j] = sig[j, i] = (p < alpha)
+ 
+         np.fill_diagonal(sig, False)
+ 
+         p_matrix = np.zeros_like(orig, dtype=float)
+         for (i,j), p in zip(zip(idx_i, idx_j), p_vals):
+             p_matrix[i, j] = p_matrix[j, i] = p
+ 
+         return sig, p_matrix
+ 
+ 
+     def compute_hurst_rs(self, series) -> float:
+         try:
+             H, _, _ = compute_Hc(series.dropna().values, kind='change', simplified=True)
+@@ -2297,52 +2366,117 @@ class BigMasterTool:
+         if df_for_analysis.empty: return {k: None for k in methods_to_get}
+ 
+         for report_label, method_variant in methods_to_get.items():
+             control_vars = ['c3'] if 'partial' in method_variant else None
+             
+             lag = lag_params.get(method_variant, DEFAULT_MAX_LAG)
+             
+             matrix = compute_connectivity_variant(df_for_analysis, method_variant, lag=lag, control=control_vars)
+ 
+             if matrix is not None:
+                 is_directed = "directed" in method_variant or "partial" in method_variant
+                 is_granger = "granger" in method_variant
+                 threshold = 0.05 if is_granger else 0.5 
+                 invert_threshold = True if is_granger else False
+ 
+                 title = f"{report_label}"
+                 legend_text = f"Lag={lag}"
+                 image_buffer = plot_connectome(matrix, title, threshold=threshold, directed=is_directed, invert_threshold=invert_threshold, legend_text=legend_text)
+                 generated_connectomes[report_label] = image_buffer
+             else:
+                 generated_connectomes[report_label] = None
+         return generated_connectomes
+ 
+ 
+ if __name__ == "__main__":
+-    parser = argparse.ArgumentParser(description="Compute connectivity measures for multivariate time series.")
+-    parser.add_argument("input_file", help="Path to input CSV or Excel file with time series data")
+-    parser.add_argument("--lags", type=int, default=DEFAULT_MAX_LAG, help="Lag or model order (for Granger, TE, etc.)")
+-    parser.add_argument("--log", action="store_true", help="Apply logarithm transform to data (for positive-valued data)")
+-    parser.add_argument("--no-outliers", action="store_true", help="Disable outlier removal")
+-    parser.add_argument("--no-normalize", action="store_true", help="Disable normalization of data")
+-    parser.add_argument("--no-stationarity-check", action="store_true", help="Disable stationarity check (ADF test)")
+-    parser.add_argument("--graph-threshold", type=float, default=0.5, help="Threshold for graph edges (weight >= threshold)")
+-    parser.add_argument("--output", help="Output Excel file path (if not specified, auto-generated)")
+-    args = parser.parse_args() if len(sys.argv) > 1 else parser.parse_args(["данные.xlsx"])
+-
+-    filepath = os.path.join(base_path, args.input_file)
+-
+-    tool = BigMasterTool()
+-    tool.load_data_excel(filepath, log_transform=args.log, remove_outliers=not args.no_outliers,
+-                            normalize=not args.no_normalize, fill_missing=True, check_stationarity=not args.no_stationarity_check)
++    parser = argparse.ArgumentParser(
++        description="Compute connectivity measures for multivariate time series."
++    )
++    parser.add_argument(
++        "input_file",
++        help="Path to input CSV or Excel file with time series data",
++    )
++    parser.add_argument(
++        "--lags",
++        type=int,
++        default=DEFAULT_MAX_LAG,
++        help="Lag or model order (for Granger, TE, etc.)",
++    )
++    parser.add_argument(
++        "--log",
++        action="store_true",
++        help="Apply logarithm transform to data (for positive-valued data)",
++    )
++    parser.add_argument(
++        "--no-outliers",
++        action="store_true",
++        help="Disable outlier removal",
++    )
++    parser.add_argument(
++        "--no-normalize",
++        action="store_true",
++        help="Disable normalization of data",
++    )
++    parser.add_argument(
++        "--no-stationarity-check",
++        action="store_true",
++        help="Disable stationarity check (ADF test)",
++    )
++    parser.add_argument(
++        "--graph-threshold",
++        type=float,
++        default=0.5,
++        help="Threshold for graph edges (weight >= threshold)",
++    )
++    parser.add_argument(
++        "--output",
++        default=None,
++        help="Output Excel file path (defaults to TimeSeriesAnalysis/AllMethods_Full.xlsx)",
++    )
++    parser.add_argument(
++        "--quiet-warnings",
++        action="store_true",
++        help="Suppress most warnings for cleaner CLI output.",
++    )
++    parser.add_argument(
++        "--experimental",
++        action="store_true",
++        help="Enable experimental sliding-window analyses.",
++    )
++    args = parser.parse_args()
++
++    logging.basicConfig(
++        level=logging.INFO,
++        format="%(asctime)s %(levelname)s %(message)s",
++    )
++    configure_warnings(quiet=args.quiet_warnings)
++
++    filepath = os.path.abspath(args.input_file)
++    output_path = args.output or os.path.join(save_folder, "AllMethods_Full.xlsx")
++    output_dir = os.path.dirname(output_path)
++    if output_dir:
++        os.makedirs(output_dir, exist_ok=True)
++
++    tool = BigMasterTool(enable_experimental=args.experimental)
++    tool.lag_ranges = {v: range(1, args.lags + 1) for v in method_mapping}
++    tool.load_data_excel(
++        filepath,
++        log_transform=args.log,
++        remove_outliers=not args.no_outliers,
++        normalize=not args.no_normalize,
++        fill_missing=True,
++        check_stationarity=not args.no_stationarity_check,
++    )
+     tool.run_all_methods()
+-    final_path = os.path.join(save_folder, "AllMethods_Full.xlsx")
+-    tool.export_big_excel(final_path, threshold=args.graph_threshold, window_size=100, overlap=50,
+-                            log_transform=args.log, remove_outliers=not args.no_outliers,
+-                            normalize=not args.no_normalize, fill_missing=True, check_stationarity=not args.no_stationarity_check)
+-
+-    print("Анализ завершён, результаты сохранены в:", final_path)
+-    logging.info("[Export] Лист Undirected Methods добавлен.")
+-    logging.info("[Export] Лист Directed Methods добавлен.")
+-    logging.info("[Summary] Лист Summary заполнен.")
+-    logging.info(f"[Export] Excel файл сохранён: {final_path}")
++    tool.export_big_excel(
++        output_path,
++        threshold=args.graph_threshold,
++        window_size=100,
++        overlap=50,
++        log_transform=args.log,
++        remove_outliers=not args.no_outliers,
++        normalize=not args.no_normalize,
++        fill_missing=True,
++        check_stationarity=not args.no_stationarity_check,
++    )
++
++    print("Анализ завершён, результаты сохранены в:", output_path)
