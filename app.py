@@ -100,7 +100,6 @@ def main() -> None:
         suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
         with tempfile.TemporaryDirectory() as tmp_dir:
             input_path = os.path.join(tmp_dir, f"input{suffix}")
-            output_path = os.path.join(tmp_dir, "AllMethods_Full.xlsx")
 
             with open(input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
