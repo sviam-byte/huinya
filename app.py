@@ -11,19 +11,30 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import List
+from types import ModuleType
+from typing import List, Mapping, Sequence
 
 import streamlit as st
 
-def _tool():
+
+def _tool() -> ModuleType:
     """Ленивая загрузка heavy-модуля для Streamlit Cloud."""
     import tool
     return tool
 
 
-def _resolve_selected_methods(selected: List[str], mapping) -> List[str]:
+def _resolve_selected_methods(selected: Sequence[str], mapping: Mapping[str, object]) -> List[str]:
     """Оставляет только методы, которые реально доступны в mapping."""
     return [m for m in selected if m in mapping]
+
+
+def _is_cloud_env() -> bool:
+    """Пытаемся определить облачную среду Streamlit, чтобы не грузить тяжелые экспорты."""
+    return (
+        os.getenv("STREAMLIT_CLOUD") == "true"
+        or os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
+        or os.getenv("STREAMLIT_SHARING") == "true"
+    )
 
 
 def main() -> None:
@@ -70,6 +81,17 @@ def main() -> None:
     if any(method in tool.EXPERIMENTAL_METHODS for method in selected_methods):
         st.warning("Часть выбранных методов помечена как experimental.")
 
+    is_cloud = _is_cloud_env()
+    generate_excel = False
+    if is_cloud:
+        st.info("В облаке полный Excel-отчёт отключён (слишком тяжело для Streamlit Cloud).")
+    else:
+        generate_excel = st.checkbox(
+            "Generate full Excel report (slow)",
+            value=False,
+            help="Создаёт полный отчёт. Может занять время и много памяти.",
+        )
+
     if st.button("Run", type="primary"):
         if not uploaded_file:
             st.error("Сначала загрузите файл CSV/XLSX.")
@@ -95,6 +117,18 @@ def main() -> None:
                     check_stationarity=False,
                 )
                 engine.run_all_methods()
+                if generate_excel:
+                    engine.export_big_excel(
+                        output_path,
+                        threshold=threshold,
+                        window_size=100,
+                        overlap=50,
+                        log_transform=log_transform,
+                        remove_outliers=remove_outliers,
+                        normalize=normalize,
+                        fill_missing=True,
+                        check_stationarity=False,
+                    )
 
             resolved_methods = _resolve_selected_methods(selected_methods, tool.method_mapping)
             if not resolved_methods:
@@ -122,7 +156,18 @@ def main() -> None:
             )
             st.image(connectome, caption=primary_method)
 
-            st.caption("Полный Excel-отчёт: `python cli.py <file> --lags N --graph-threshold T` (локально)")
+            if generate_excel:
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        "Download Excel",
+                        data=f.read(),
+                        file_name="AllMethods_Full.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            else:
+                st.caption(
+                    "Полный Excel-отчёт: `python cli.py <file> --lags N --graph-threshold T` (локально)"
+                )
 
 
 if __name__ == "__main__":
