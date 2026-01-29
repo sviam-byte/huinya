@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import importlib
+import importlib.util
 import logging
 import os
 import warnings
@@ -16,7 +18,6 @@ import networkx as nx
 import nolds
 import numpy as np
 import pandas as pd
-import pyinform
 import scipy.signal as signal
 from hurst import compute_Hc
 from openpyxl import Workbook
@@ -77,7 +78,10 @@ STABLE_METHODS = [
     "granger_full",
 ]
 
-EXPERIMENTAL_METHODS = [
+# Флаг наличия pyinform: нужен для расчёта transfer entropy.
+PYINFORM_AVAILABLE = importlib.util.find_spec("pyinform") is not None
+
+EXPERIMENTAL_METHODS_BASE = [
     "mutinf_full",
     "mutinf_partial",
     "te_full",
@@ -86,6 +90,13 @@ EXPERIMENTAL_METHODS = [
     "ah_full",
     "ah_partial",
     "ah_directed",
+]
+
+# Если pyinform недоступен, скрываем TE-методы из списка UI.
+EXPERIMENTAL_METHODS = [
+    method
+    for method in EXPERIMENTAL_METHODS_BASE
+    if PYINFORM_AVAILABLE or not method.startswith("te_")
 ]
 
 ##############################################
@@ -326,11 +337,23 @@ def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwar
                     G[i, j] = np.nan
     return G
 
+def _load_pyinform():
+    """Ленивая загрузка pyinform без падения всего приложения."""
+    if not PYINFORM_AVAILABLE:
+        logging.warning(
+            "[PyInform] pyinform не установлен: TE-методы будут отключены.",
+        )
+        return None
+    return importlib.import_module("pyinform")
+
+
 def compute_TE(source: np.ndarray, target: np.ndarray, lag: int = 1, bins: int = DEFAULT_BINS):
-    """
-     Transfer Entropy
-    """
+    """Transfer Entropy с защитой от отсутствия pyinform."""
     try:
+        pyinform = _load_pyinform()
+        if pyinform is None:
+            return np.nan
+
         def discretize_manual(series, num_bins):
             series_f = series.astype(np.float64)
             min_val, max_val = np.min(series_f), np.max(series_f)

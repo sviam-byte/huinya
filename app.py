@@ -14,6 +14,7 @@ import streamlit as st
 from tool import (
     BigMasterTool,
     EXPERIMENTAL_METHODS,
+    PYINFORM_AVAILABLE,
     STABLE_METHODS,
     compute_connectivity_variant,
     configure_warnings,
@@ -58,6 +59,9 @@ def main() -> None:
         log_transform = st.checkbox("log", value=False)
     with col6:
         quiet_warnings = st.checkbox("quiet warnings", value=False)
+
+    if not PYINFORM_AVAILABLE:
+        st.info("TE-методы скрыты: установите pyinform для transfer entropy.")
 
     method_options = STABLE_METHODS + EXPERIMENTAL_METHODS
     selected_methods = st.multiselect(
