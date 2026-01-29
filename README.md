@@ -8,6 +8,14 @@
 pip install -r requirements.txt
 ```
 
+### Опциональные зависимости
+
+- Для методов transfer entropy (TE) требуется пакет `pyinform`:
+
+```bash
+pip install pyinform
+```
+
 ## Как запустить (один гарантированный путь)
 
 CLI:
