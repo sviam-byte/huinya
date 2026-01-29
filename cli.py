@@ -58,7 +58,7 @@ def main() -> None:
         remove_outliers=not args.no_outliers,
         normalize=not args.no_normalize,
         fill_missing=True,
-        check_stationarity=not args.no_outliers,
+        check_stationarity=not args.no_stationarity_check,
     )
 
     print("Готово. Excel сохранён в:", output_path)
