@@ -358,7 +358,7 @@ def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwar
             data_pair = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             if len(data_pair) > lags * 2 + 5:
                 try:
-                    tests = grangercausalitytests(data_pair, maxlag=[lags], verbose=False)
+                    tests = grangercausalitytests(data_pair, maxlag=lags, verbose=False)
                     G[src, tgt] = tests[lags][0]['ssr_ftest'][1]
                 except (np.linalg.LinAlgError, ValueError):
                     G[src, tgt] = np.nan
@@ -629,7 +629,7 @@ def _compute_granger_matrix_internal(df: pd.DataFrame, lags: int = DEFAULT_MAX_L
                 continue
             sub = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             try:
-                tests = grangercausalitytests(sub, maxlag=[lags], verbose=False)
+                tests = grangercausalitytests(sub, maxlag=lags, verbose=False)
                 pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
                 G[src, tgt] = min(pvals)
             except Exception as e:
@@ -1123,6 +1123,16 @@ def _is_pvalue_method(variant: str) -> bool:
 
 def _is_directed_method(variant: str) -> bool:
     return variant in DIRECTED_METHODS
+
+
+def is_pvalue_method(name: str) -> bool:
+    """Публичный алиас для p-value семантики метода."""
+    return _is_pvalue_method(name)
+
+
+def is_directed_method(name: str) -> bool:
+    """Публичный алиас для направленности метода."""
+    return _is_directed_method(name)
 
 
 def _lag_quality(variant: str, mat: np.ndarray) -> float:
@@ -2055,8 +2065,8 @@ class BigMasterTool:
 
 
     def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, window_size: int, overlap: int, p_value_alpha: float = 0.05) -> None:
-        directed_flag = _is_directed_method(variant)
-        is_pval = _is_pvalue_method(variant)
+        directed_flag = (variant in self.directed_methods) or is_directed_method(variant)
+        is_pval = is_pvalue_method(variant)
         edge_threshold = p_value_alpha if is_pval else threshold
         invert_threshold = True if is_pval else False
         ws = wb.create_sheet(variant.upper() + " Results")
@@ -2186,7 +2196,7 @@ class BigMasterTool:
         indices = {c: i for i, c in enumerate(self.data.columns)}
         
         for variant in full_methods:
-            spec = get_method_spec(variant); is_pval = _is_pvalue_method(variant)
+            spec = get_method_spec(variant); is_pval = is_pvalue_method(variant)
             lag_res = self.lag_results.get(variant, {}) # берём превыч
             
             best_lag, median_lag, _ = self.select_lag_metrics(lag_res, variant)
@@ -2270,7 +2280,7 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        if _is_pvalue_method(variant):
+                        if is_pvalue_method(variant):
                             cell.fill = fill_green if v < p_value_alpha else fill_pink
                         else:
                             cell.fill = fill_green if abs(v) > graph_threshold else fill_pink
@@ -2505,19 +2515,19 @@ class BigMasterTool:
             matrix = compute_connectivity_variant(df_for_analysis, method_variant, lag=lag, control=control_vars)
 
             if matrix is not None:
-                spec = get_method_spec(method_variant)
-                is_directed = spec.directed
-                is_pval = _is_pvalue_method(variant)
-                edge_threshold = DEFAULT_PVALUE_ALPHA if spec.is_p_value else DEFAULT_EDGE_THRESHOLD 
-                invert_threshold = True if is_p_value else False
+                is_directed = is_directed_method(method_variant)
+                is_pval = is_pvalue_method(method_variant)
+                threshold = 0.05 if is_pval else 0.5
+                invert_threshold = True if is_pval else False
 
                 title = f"{report_label}"
                 legend_text = f"Lag={lag}"
-                image_buffer = plot_connectome(matrix, title, threshold=edge_threshold, directed=is_directed, invert_threshold=invert_threshold, legend_text=legend_text)
+                image_buffer = plot_connectome(matrix, title, threshold=threshold, directed=is_directed, invert_threshold=invert_threshold, legend_text=legend_text)
                 generated_connectomes[report_label] = image_buffer
             else:
                 generated_connectomes[report_label] = None
         return generated_connectomes
+
 
 
     # -----------------------------
@@ -2588,7 +2598,7 @@ class BigMasterTool:
         sections.append("<ul>" + "".join(toc_items) + "</ul>")
 
         for variant in methods:
-            is_pval = _is_pvalue_method(variant)
+            is_pval = is_pvalue_method(variant)
             is_dir = _is_directed_method(variant)
             thr = p_value_alpha if is_pval else graph_threshold
             inv = True if is_pval else False

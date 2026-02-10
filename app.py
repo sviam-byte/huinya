@@ -81,10 +81,12 @@ def main() -> None:
         st.info("TE-методы скрыты: установи pyinform (локально), если нужно.")
 
     method_options = tool.STABLE_METHODS + tool.EXPERIMENTAL_METHODS
+    if not tool.PYINFORM_AVAILABLE:
+        method_options = [m for m in method_options if not m.startswith("te_")]
     selected_methods = st.multiselect(
         "Methods",
         options=method_options,
-        default=tool.STABLE_METHODS,
+        default=[m for m in tool.STABLE_METHODS if m in method_options],
     )
 
     if any(method in tool.EXPERIMENTAL_METHODS for method in selected_methods):
@@ -156,8 +158,8 @@ def main() -> None:
             st.subheader("Connectome")
             primary_method = resolved_methods[0]
             matrix = tool.compute_connectivity_variant(engine.data_normalized, primary_method, lag=lag)
-            directed = primary_method in getattr(tool, "DIRECTED_METHODS", set()) or ("_directed" in primary_method) or primary_method.startswith(("granger_", "te_", "ah_"))
-            invert = primary_method in getattr(tool, "PVAL_METHODS", set())
+            directed = getattr(tool, "is_directed_method", lambda x: ("directed" in x))(primary_method)
+            invert = getattr(tool, "is_pvalue_method", lambda x: ("granger" in x))(primary_method)
             edge_threshold = alpha if invert else threshold
             connectome = tool.plot_connectome(
                 matrix,
