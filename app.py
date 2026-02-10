@@ -49,7 +49,7 @@ def main() -> None:
         lag = st.number_input("Lag", min_value=1, max_value=50, value=1, step=1)
     with col2:
         threshold = st.number_input(
-            "Threshold",
+            "Weight threshold",
             min_value=0.0,
             max_value=1.0,
             value=0.2,
@@ -58,6 +58,15 @@ def main() -> None:
     with col3:
         normalize = st.checkbox("normalize", value=True)
 
+
+    # Для p-value (Granger full / directed) нужен отдельный порог
+    alpha = st.number_input(
+        "p-value alpha (for Granger p-values)",
+        min_value=0.001,
+        max_value=1.0,
+        value=0.05,
+        step=0.01,
+    )
     col4, col5, col6 = st.columns(3)
     with col4:
         remove_outliers = st.checkbox("outliers", value=True)
@@ -100,6 +109,7 @@ def main() -> None:
         suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
         with tempfile.TemporaryDirectory() as tmp_dir:
             input_path = os.path.join(tmp_dir, f"input{suffix}")
+            output_path = os.path.join(tmp_dir, "AllMethods_Full.xlsx")
 
             with open(input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
@@ -122,6 +132,7 @@ def main() -> None:
                     engine.export_big_excel(
                         output_path,
                         threshold=threshold,
+                        p_value_alpha=alpha,
                         window_size=100,
                         overlap=50,
                         log_transform=log_transform,
@@ -148,7 +159,7 @@ def main() -> None:
             spec = tool.get_method_spec(primary_method)
             directed = spec.directed
             invert = spec.is_p_value
-            edge_threshold = 0.05 if spec.is_p_value else threshold
+            edge_threshold = alpha if spec.is_p_value else threshold
             connectome = tool.plot_connectome(
                 matrix,
                 f"{primary_method} Connectome",

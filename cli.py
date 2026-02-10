@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Compute connectivity measures for multivariate time series.")
     p.add_argument("input_file", help="Path to input CSV or Excel file with time series data")
     p.add_argument("--lags", type=int, default=5, help="Max lag/model order (for Granger, TE, etc.)")
+    p.add_argument("--pvalue-alpha", type=float, default=0.05, help="Alpha for p-value methods (Granger full/directed)")
     p.add_argument("--log", action="store_true", help="Apply logarithm transform to data (for positive-valued data)")
     p.add_argument("--no-outliers", action="store_true", help="Disable outlier removal")
     p.add_argument("--no-normalize", action="store_true", help="Disable normalization of data")
@@ -52,6 +53,7 @@ def main() -> None:
     tool.export_big_excel(
         output_path,
         threshold=args.graph_threshold,
+        p_value_alpha=args.pvalue_alpha,
         window_size=100,
         overlap=50,
         log_transform=args.log,

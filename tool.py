@@ -71,6 +71,8 @@ DEFAULT_OUTLIER_Z = 5
 DEFAULT_REGULARIZATION = 1e-8
 DEFAULT_EMBED_DIM = 3
 DEFAULT_EMBED_TAU = 1
+DEFAULT_PVALUE_ALPHA = 0.05
+DEFAULT_EDGE_THRESHOLD = 0.2
 
 STABLE_METHODS = [
     "correlation_full",
@@ -610,22 +612,24 @@ def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
 
 # эта матрица НЕ ТА ЖЕ ЧТО В МАППИНГЕ
 def _compute_granger_matrix_internal(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG) -> np.ndarray:
+    """Возвращает матрицу p-value Granger в конвенции M[src, tgt]."""
     n = df.shape[1]
     G = np.zeros((n, n))
     cols = df.columns.tolist()
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                G[i, j] = 0.0
-            else:
-                sub = df[[cols[j], cols[i]]].dropna()
-                try:
-                    tests = grangercausalitytests(sub, maxlag=[lags], verbose=False)
-                    pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
-                    G[i, j] = min(pvals)
-                except Exception as e: 
-                    logging.error(f"[Granger-Internal] Ошибка Granger для {cols[j]}->{cols[i]}: {e}")
-                    G[i, j] = np.nan
+    for src_idx, src in enumerate(cols):
+        for tgt_idx, tgt in enumerate(cols):
+            if src_idx == tgt_idx:
+                G[src_idx, tgt_idx] = 0.0
+                continue
+            # grangercausalitytests проверяет второй столбец -> первый: подаём [tgt, src]
+            sub = df[[tgt, src]].dropna()
+            try:
+                tests = grangercausalitytests(sub, maxlag=lags, verbose=False)
+                pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
+                G[src_idx, tgt_idx] = min(pvals)
+            except Exception as e:
+                logging.error(f"[Granger-Internal] Ошибка Granger для {src}->{tgt}: {e}")
+                G[src_idx, tgt_idx] = np.nan
     return G
 
 
@@ -971,18 +975,22 @@ def plot_connectome(matrix: np.ndarray, method_name: str, threshold: float = 0.2
     n = matrix.shape[0]
     G = nx.DiGraph() if directed else nx.Graph()
     G.add_nodes_from(range(n))
-    for src in range(n):
-        for tgt in range(n):
-            if src == tgt:
+    for i in range(n):
+        for j in range(n):
+            if i == j:
                 continue
-            if matrix[src, tgt] is None or np.isnan(matrix[src, tgt]):
+            if not directed and j < i:
+                continue
+            val = matrix[i, j]
+            if val is None or np.isnan(val):
                 continue
             if invert_threshold:
-                if matrix[src, tgt] < threshold:
-                    G.add_edge(src, tgt, weight=matrix[src, tgt])
+                # p-value: меньше = лучше
+                if val <= threshold:
+                    G.add_edge(i, j, weight=val)
             else:
-                if abs(matrix[src, tgt]) > threshold:
-                    G.add_edge(src, tgt, weight=matrix[src, tgt])
+                if abs(val) >= threshold:
+                    G.add_edge(i, j, weight=val)
     pos = nx.circular_layout(G)
     fig, ax = plt.subplots(figsize=(4, 4))
     if directed:
@@ -1016,7 +1024,7 @@ def add_method_to_sheet(ws, row: int, title: str, matrix: np.ndarray, directed: 
     img_heat.width = 400
     img_heat.height = 300
     ws.add_image(img_heat, f"A{ws.max_row + 2}")
-    buf_conn = plot_connectome(matrix, title + " Connectome", threshold=0.2, directed=directed, invert_threshold=False, legend_text=legend_text)
+    buf_conn = plot_connectome(matrix, title + " Connectome", threshold=DEFAULT_EDGE_THRESHOLD, directed=directed, invert_threshold=False, legend_text=legend_text)
     img_conn = Image(buf_conn)
     img_conn.width = 400
     img_conn.height = 400
@@ -1081,38 +1089,61 @@ method_mapping = {
 class MethodSpec:
     directed: bool
     is_p_value: bool
+    control_dependent: bool
     supports_lag: bool
+    description: str = ""
 
-
-METHOD_SPECS = {
-    "correlation_full":     MethodSpec(False, False, False),
-    "correlation_partial":  MethodSpec(False, False, False),
-    "h2_full":              MethodSpec(False, False, False),
-    "h2_partial":           MethodSpec(False, False, False),
-    "mutinf_full":          MethodSpec(False, False, False),
-    "mutinf_partial":       MethodSpec(False, False, False),
-    "coherence_full":       MethodSpec(False, False, False),
-
-    "correlation_directed": MethodSpec(True,  False, True),
-    "h2_directed":          MethodSpec(True,  False, True),
-    "granger_partial":      MethodSpec(True,  False, True),
-    "te_full":              MethodSpec(True,  False, True),
-    "te_partial":           MethodSpec(True,  False, True),
-    "te_directed":          MethodSpec(True,  False, True),
-    "ah_full":              MethodSpec(True,  False, False),
-    "ah_partial":           MethodSpec(True,  False, True),
-    "ah_directed":          MethodSpec(True,  False, True),
-
-    "granger_full":         MethodSpec(True,  True,  True),
-    "granger_directed":     MethodSpec(True,  True,  True),
+# ВАЖНО: конвенция для directed-матриц — M[src, tgt]
+_DIRECTED_METHODS = {
+    "correlation_directed",
+    "h2_directed",
+    "granger_full",
+    "granger_partial",
+    "granger_directed",
+    "te_full",
+    "te_partial",
+    "te_directed",
+    "ah_full",
+    "ah_partial",
+    "ah_directed",
+}
+_PVALUE_METHODS = {"granger_full", "granger_directed"}
+_CONTROL_DEPENDENT = {
+    "correlation_partial",
+    "h2_partial",
+    "mutinf_partial",
+    "te_partial",
+    "te_directed",
+    "ah_partial",
+    "ah_directed",
+}
+_LAG_SUPPORTED = {
+    "correlation_directed",
+    "h2_directed",
+    "granger_full",
+    "granger_partial",
+    "granger_directed",
+    "te_full",
+    "te_partial",
+    "te_directed",
+    "ah_full",
+    "ah_partial",
+    "ah_directed",
 }
 
 
 def get_method_spec(variant: str) -> MethodSpec:
-    spec = METHOD_SPECS.get(variant)
-    if spec is None:
-        return MethodSpec(False, False, False)
-    return spec
+    v = variant.lower()
+    directed = variant in _DIRECTED_METHODS or ("directed" in v) or (variant in {"granger_full", "te_full", "ah_full"})
+    is_p_value = variant in _PVALUE_METHODS
+    control_dependent = variant in _CONTROL_DEPENDENT
+    supports_lag = variant in _LAG_SUPPORTED
+    return MethodSpec(
+        directed=directed,
+        is_p_value=is_p_value,
+        control_dependent=control_dependent,
+        supports_lag=supports_lag,
+    )
 
 def compute_connectivity_variant(data, variant, lag=1, control=None):
     try:
@@ -1570,16 +1601,21 @@ class BigMasterTool:
             logging.warning("[Matrices] Нет данных для вычисления матриц.")
             return
 
-        base_methods = [m for m in method_mapping.keys() if m not in EXPERIMENTAL_METHODS_BASE]
-        methods_to_run = base_methods + (EXPERIMENTAL_METHODS if self.enable_experimental else [])
         self.all_control_sets = [list(s) for s in powerset(self.data_normalized.columns)]
         self.connectivity_matrices = {}
-        for method in methods_to_run:
+        for method in method_mapping.keys():
             self.connectivity_matrices[method] = {}
-            for S in self.all_control_sets:
-                mat = compute_connectivity_variant(self.data_normalized, method, lag=1, control=S)
+            spec = get_method_spec(method)
+            if spec.control_dependent:
+                for S in self.all_control_sets:
+                    mat = compute_connectivity_variant(self.data_normalized, method, lag=1, control=S)
+                    if mat is not None:
+                        self.connectivity_matrices[method][frozenset(S)] = mat
+            else:
+                # Метод не зависит от control set: достаточно одного расчёта.
+                mat = compute_connectivity_variant(self.data_normalized, method, lag=1, control=None)
                 if mat is not None:
-                    self.connectivity_matrices[method][frozenset(S)] = mat
+                    self.connectivity_matrices[method][frozenset()] = mat
         logging.info("[Matrices] Все матрицы вычислены.")
 
     def prepare_pairs(self):
@@ -1926,7 +1962,7 @@ class BigMasterTool:
             else:
                 ws.append([col, "Нет пиков", "Нет пиков", "Сезонность не обнаружена"])
                 
-    def export_undirected_sheet(self, wb: Workbook):
+    def export_undirected_sheet(self, wb: Workbook, threshold: float, p_value_alpha: float):
         ws = wb.create_sheet("Undirected Methods")
         headers = ["Pair", "Control Set"] + self.undirected_methods
         ws.append(headers)
@@ -1939,7 +1975,10 @@ class BigMasterTool:
             S_str = ",".join(S) if S else "None"
             vals = [pair_str, S_str]
             for method in self.undirected_methods:
-                mat = self.connectivity_matrices[method].get(frozenset(S), None)
+                mats = self.connectivity_matrices.get(method, {})
+                mat = mats.get(frozenset(S), None)
+                if mat is None:
+                    mat = mats.get(frozenset(), None)
                 if mat is not None:
                     v = self.get_undirected_value(mat, pair[0], pair[1], indices)
                     vals.append(fmt_val(v))
@@ -1951,17 +1990,18 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        if "granger" in method.lower():
-                            cell.fill = fill_green if abs(v) < 0.05 else fill_pink
+                        spec = get_method_spec(method)
+                        if spec.is_p_value:
+                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
                         else:
-                            cell.fill = fill_green if abs(v) > 0.2 else fill_pink
+                            cell.fill = fill_green if abs(v) >= threshold else fill_pink
                     except:
                         pass
         for col in ws.columns:
             max_length = max(len(str(cell.value)) for cell in col if cell.value is not None)
             ws.column_dimensions[get_column_letter(col[0].column)].width = max_length
 
-    def export_directed_sheet(self, wb: Workbook):
+    def export_directed_sheet(self, wb: Workbook, threshold: float, p_value_alpha: float):
         ws = wb.create_sheet("Directed Methods")
         headers = ["Directed Pair", "Control Set"] + self.directed_methods
         ws.append(headers)
@@ -1974,7 +2014,10 @@ class BigMasterTool:
             S_str = ",".join(S) if S else "None"
             vals = [pair_str, S_str]
             for method in self.directed_methods:
-                mat = self.connectivity_matrices[method].get(frozenset(S), None)
+                mats = self.connectivity_matrices.get(method, {})
+                mat = mats.get(frozenset(S), None)
+                if mat is None:
+                    mat = mats.get(frozenset(), None)
                 if mat is not None:
                     v = self.get_directed_value(mat, pair[0], pair[1], indices)
                     vals.append(fmt_val(v))
@@ -1986,10 +2029,11 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        if "granger" in method.lower():
-                            cell.fill = fill_green if abs(v) < 0.05 else fill_pink
+                        spec = get_method_spec(method)
+                        if spec.is_p_value:
+                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
                         else:
-                            cell.fill = fill_green if abs(v) > 0.2 else fill_pink
+                            cell.fill = fill_green if abs(v) >= threshold else fill_pink
                     except:
                         pass
         for col in ws.columns:
@@ -2016,13 +2060,17 @@ class BigMasterTool:
         return best, median, worst
 
 
-    def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, window_size: int, overlap: int) -> None:
+    def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, p_value_alpha: float, window_size: int, overlap: int) -> None:
         spec = get_method_spec(variant)
         directed_flag = spec.directed
-        edge_threshold = 0.05 if spec.is_p_value else threshold
+        edge_threshold = p_value_alpha if spec.is_p_value else threshold
         invert_threshold = True if spec.is_p_value else False
         ws = wb.create_sheet(variant.upper() + " Results")
         ws.append([f"Метод: {variant.upper()} (Лаг = 1, окно = {window_size})"])
+        if spec.is_p_value:
+            ws.append([f"Интерпретация: p-value (меньше = сильнее), типичный порог α={p_value_alpha}"])
+        else:
+            ws.append([f"Интерпретация: сила связи (|value| больше = сильнее), порог визуализации {threshold}"])
         full_mat = compute_connectivity_variant(self.data_normalized, variant, lag=1)
         if full_mat is None or not hasattr(full_mat, "shape") or (full_mat.shape[0] != self.data_normalized.shape[1] or full_mat.shape[1] != self.data_normalized.shape[1]):
              ws.append([f"{variant.upper()}: Метод не работает для этих данных или вернул матрицу некорректного размера."])
@@ -2053,7 +2101,7 @@ class BigMasterTool:
             img_med_heat.width = 400
             img_med_heat.height = 300
             ws.add_image(img_med_heat, "A20")
-            buf_med_conn = plot_connectome(med_mat, f"{variant.upper()} Connectome (Median Lag)", threshold, directed=directed_flag, legend_text=legend_text_med)
+            buf_med_conn = plot_connectome(med_mat, f"{variant.upper()} Connectome (Median Lag)", threshold=edge_threshold, directed=directed_flag, invert_threshold=invert_threshold, legend_text=legend_text_med)
             img_med_conn = Image(buf_med_conn)
             img_med_conn.width = 400
             img_med_conn.height = 400
@@ -2070,7 +2118,7 @@ class BigMasterTool:
             img_best_heat.width = 400
             img_best_heat.height = 300
             ws.add_image(img_best_heat, "M20")
-            buf_best_conn = plot_connectome(best_mat, f"{variant.upper()} Connectome (Best Lag)", threshold, directed=directed_flag, legend_text=legend_text_best)
+            buf_best_conn = plot_connectome(best_mat, f"{variant.upper()} Connectome (Best Lag)", threshold=edge_threshold, directed=directed_flag, invert_threshold=invert_threshold, legend_text=legend_text_best)
             img_best_conn = Image(buf_best_conn)
             img_best_conn.width = 400
             img_best_conn.height = 400
@@ -2123,12 +2171,9 @@ class BigMasterTool:
             ws.add_image(img_best_conn, "G40")
         ws.append(["--- Конец листа ---"])
 
-    def export_summary_sheet(self, wb: Workbook) -> None:
+    def export_summary_sheet(self, wb: Workbook, threshold: float, p_value_alpha: float) -> None:
         ws_summary = wb.create_sheet("Summary")
-        full_methods = [m for m in self.results if "partial" not in m and m != "granger_full"]
-        # 
-        if "granger_directed" in self.results and "granger_directed" not in full_methods:
-            full_methods.append("granger_directed")        
+        full_methods = [m for m in self.results if "partial" not in m and m != "granger_directed"]        
         undirected_pairs = list(combinations(self.data.columns, 2))
         directed_pairs = list(permutations(self.data.columns, 2))
         
@@ -2162,8 +2207,21 @@ class BigMasterTool:
                 if mat_med is not None and mat_best is not None:
                     i, j = indices.get(var1, -1), indices.get(var2, -1) 
                     if i != -1 and j != -1:
-                        val_med = mat_med[min(i, j), max(i, j)] if mat_med.shape[0] > max(i,j) and mat_med.shape[1] > max(i,j) else np.nan
-                        val_best = mat_best[min(i, j), max(i, j)] if mat_best.shape[0] > max(i,j) and mat_best.shape[1] > max(i,j) else np.nan
+                        if spec.directed:
+                            a_med = mat_med[i, j] if mat_med.shape[0] > i and mat_med.shape[1] > j else np.nan
+                            b_med = mat_med[j, i] if mat_med.shape[0] > j and mat_med.shape[1] > i else np.nan
+                            a_best = mat_best[i, j] if mat_best.shape[0] > i and mat_best.shape[1] > j else np.nan
+                            b_best = mat_best[j, i] if mat_best.shape[0] > j and mat_best.shape[1] > i else np.nan
+                            if spec.is_p_value:
+                                val_med = np.nanmin([a_med, b_med])
+                                val_best = np.nanmin([a_best, b_best])
+                            else:
+                                val_med = np.nanmax([abs(a_med), abs(b_med)])
+                                val_best = np.nanmax([abs(a_best), abs(b_best)])
+                        else:
+                            mi, mj = min(i, j), max(i, j)
+                            val_med = mat_med[mi, mj] if mat_med.shape[0] > mj and mat_med.shape[1] > mj else np.nan
+                            val_best = mat_best[mi, mj] if mat_best.shape[0] > mj and mat_best.shape[1] > mj else np.nan
                     else:
                         val_med, val_best = np.nan, np.nan
                 else:
@@ -2219,9 +2277,9 @@ class BigMasterTool:
                     try:
                         v = float(cell.value)
                         if is_p_value:
-                            cell.fill = fill_green if abs(v) < 0.05 else fill_pink
+                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
                         else:
-                            cell.fill = fill_green if abs(v) > 0.2 else fill_pink
+                            cell.fill = fill_green if abs(v) >= threshold else fill_pink
                     except:
                         pass
         
@@ -2268,14 +2326,14 @@ class BigMasterTool:
             cell = f"D{ws.max_row}"
             ws.add_image(img, cell)
 
-    def export_big_excel(self, save_path: str = "AllMethods_Full.xlsx", threshold: float = 0.2, window_size: int = 100, overlap: int = 50,
+    def export_big_excel(self, save_path: str = "AllMethods_Full.xlsx", threshold: float = 0.2, p_value_alpha: float = DEFAULT_PVALUE_ALPHA, window_size: int = 100, overlap: int = 50,
                            log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> str:
         wb = Workbook()
         wb.remove(wb.active)
         add_raw_data_sheet(wb, self.data) 
-        self.export_summary_sheet(wb)     
-        self.export_undirected_sheet(wb)     
-        self.export_directed_sheet(wb)         
+        self.export_summary_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
+        self.export_undirected_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
+        self.export_directed_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
         ws_diag = wb.create_sheet("Data & Diagnostics")
         ws_diag.append(["Диагностика (Original) с информацией о сезонности"])
         for c in self.data.columns:
@@ -2309,7 +2367,7 @@ class BigMasterTool:
         
         # --- ЛИСТЫ методов отдельно ---
         for variant in method_mapping.keys():
-            self.export_method_sheet(wb, variant, threshold, window_size, overlap)
+            self.export_method_sheet(wb, variant, threshold=threshold, p_value_alpha=p_value_alpha, window_size=window_size, overlap=overlap)
         
         self.export_hurst_sheet(wb, "Hurst_RS", self.compute_hurst_rs, self.plot_autocorrelation)
         self.export_hurst_sheet(wb, "Hurst_DFA", self.compute_hurst_dfa, self.plot_power_spectrum)
@@ -2424,7 +2482,7 @@ class BigMasterTool:
 
         for report_label, method_variant in methods_to_get.items():
             # ПРЕДЗАДАННЫЕ КОНТРОЛЬНЫЕ для этих там
-            control_vars = ['c3'] if 'partial' in method_variant else None
+            control_vars = list(df_for_analysis.columns) if 'partial' in method_variant else None
             
             lag = lag_params.get(method_variant, DEFAULT_MAX_LAG)
             
@@ -2446,7 +2504,7 @@ class BigMasterTool:
         if df_for_analysis.empty: return {k: None for k in methods_to_get}
 
         for report_label, method_variant in methods_to_get.items():
-            control_vars = ['c3'] if 'partial' in method_variant else None
+            control_vars = list(df_for_analysis.columns) if 'partial' in method_variant else None
             
             lag = lag_params.get(method_variant, DEFAULT_MAX_LAG)
             
@@ -2456,12 +2514,12 @@ class BigMasterTool:
                 spec = get_method_spec(method_variant)
                 is_directed = spec.directed
                 is_p_value = spec.is_p_value
-                threshold = 0.05 if is_p_value else 0.5 
+                edge_threshold = DEFAULT_PVALUE_ALPHA if spec.is_p_value else DEFAULT_EDGE_THRESHOLD 
                 invert_threshold = True if is_p_value else False
 
                 title = f"{report_label}"
                 legend_text = f"Lag={lag}"
-                image_buffer = plot_connectome(matrix, title, threshold=threshold, directed=is_directed, invert_threshold=invert_threshold, legend_text=legend_text)
+                image_buffer = plot_connectome(matrix, title, threshold=edge_threshold, directed=is_directed, invert_threshold=invert_threshold, legend_text=legend_text)
                 generated_connectomes[report_label] = image_buffer
             else:
                 generated_connectomes[report_label] = None
@@ -2481,6 +2539,12 @@ if __name__ == "__main__":
         type=int,
         default=DEFAULT_MAX_LAG,
         help="Lag or model order (for Granger, TE, etc.)",
+    )
+    parser.add_argument(
+        "--pvalue-alpha",
+        type=float,
+        default=DEFAULT_PVALUE_ALPHA,
+        help="Alpha for p-value methods (Granger full/directed)",
     )
     parser.add_argument(
         "--log",
@@ -2551,6 +2615,7 @@ if __name__ == "__main__":
     tool.export_big_excel(
         output_path,
         threshold=args.graph_threshold,
+        p_value_alpha=args.pvalue_alpha,
         window_size=100,
         overlap=50,
         log_transform=args.log,
