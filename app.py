@@ -63,11 +63,20 @@ def main() -> None:
     # Для p-value (Granger full / directed) нужен отдельный порог
     alpha = st.number_input(
         "p-value alpha (for Granger p-values)",
-        min_value=0.001,
-        max_value=1.0,
+        min_value=1e-6,
+        max_value=0.5,
         value=0.05,
-        step=0.01,
+        format="%.6f",
     )
+
+    st.subheader("Input parsing")
+    header_mode = st.selectbox("Header", ["auto", "yes", "no"], index=0)
+    time_col_mode = st.selectbox("Time column", ["auto", "none"], index=0)
+    transpose_mode = st.selectbox("Transpose", ["auto", "yes", "no"], index=0)
+
+    st.subheader("Preprocessing")
+    preprocess_enabled = st.checkbox("Enable preprocessing", value=True)
+
     col4, col5, col6 = st.columns(3)
     with col4:
         remove_outliers = st.checkbox("outliers", value=True)
@@ -123,12 +132,16 @@ def main() -> None:
                 f.write(uploaded_file.getbuffer())
 
             enable_experimental = any(m in tool.EXPERIMENTAL_METHODS for m in selected_methods)
-            engine = tool.BigMasterTool(enable_experimental=False)
+            engine = tool.BigMasterTool(enable_experimental=enable_experimental)
             engine.lag_ranges = {v: range(1, lag + 1) for v in tool.method_mapping}
 
             with st.spinner("Обработка данных..."):
                 engine.load_data_excel(
                     input_path,
+                    header=header_mode,
+                    time_col=time_col_mode,
+                    transpose=transpose_mode,
+                    preprocess=preprocess_enabled,
                     log_transform=log_transform,
                     remove_outliers=remove_outliers,
                     normalize=normalize,
@@ -153,9 +166,9 @@ def main() -> None:
                         check_stationarity=False,
                     )
                 if generate_html:
-                    engine.export_html_report(html_path, graph_threshold=threshold, p_alpha=0.05)
+                    engine.export_html_report(html_path, graph_threshold=threshold, p_alpha=float(alpha))
                 if generate_site:
-                    engine.export_site_report(site_dir, graph_threshold=threshold, p_alpha=0.05, zip_path=site_zip)
+                    engine.export_site_report(site_dir, graph_threshold=threshold, p_alpha=float(alpha), zip_path=site_zip)
 
             resolved_methods = _resolve_selected_methods(selected_methods, tool.method_mapping)
             if not resolved_methods:
@@ -173,7 +186,7 @@ def main() -> None:
             matrix = tool.compute_connectivity_variant(engine.data_normalized, primary_method, lag=lag)
             directed = tool.is_directed_method(primary_method)
             invert = tool.is_pvalue_method(primary_method)
-            thr = 0.05 if invert else threshold
+            thr = float(alpha) if invert else threshold
             connectome = tool.plot_connectome(
                 matrix,
                 f"{primary_method} Connectome",

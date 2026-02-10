@@ -129,57 +129,201 @@ def additional_preprocessing(df: pd.DataFrame, unique_thresh: float = 0.05) -> p
                     df[col] = transformed
     return df
 
-def load_or_generate(filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
-    try:
-        if filepath.lower().endswith(".csv"):
-            df = pd.read_csv(filepath, header=None)
-        else:
-            df = pd.read_excel(filepath, header=None)
-        
-        if df.shape[1] == 1 and isinstance(df.iloc[0,0], str):
-            df = df[0].str.split('[,;]', expand=True)
-        df = df.apply(pd.to_numeric, errors='coerce')
 
-        if df.shape[0] < df.shape[1]:
-            df = df.T
-        
-        num_cols = df.shape[1]
-        df.columns = [f'c{i+1}' for i in range(num_cols)]
-        
-        df = df.fillna(df.mean())
-        df = additional_preprocessing(df)
-        df = df.copy()
-        if log_transform:
-            df = df.applymap(lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x)
-        if remove_outliers:
-            for col in df.columns:
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    series = df[col]
-                    mean, std = series.mean(skipna=True), series.std(skipna=True)
-                    if std > 0:
-                        upper, lower = mean + DEFAULT_OUTLIER_Z * std, mean - DEFAULT_OUTLIER_Z * std
-                        outliers = (series < lower) | (series > upper)
-                        if outliers.any(): df.loc[outliers, col] = np.nan
-        if fill_missing:
-            df = df.interpolate(method='linear', limit_direction='both', axis=0).fillna(method='bfill').fillna(method='ffill').fillna(0)
-        if normalize:
-            cols_to_norm = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-            if cols_to_norm:
-                scaler = StandardScaler()
-                df[cols_to_norm] = scaler.fit_transform(df[cols_to_norm])
-        if check_stationarity:
-            for col in df.columns:
-                 if pd.api.types.is_numeric_dtype(df[col]):
-                    series = df[col].dropna()
-                    if len(series) > 10:
-                        pvalue = adfuller(series, autolag='AIC')[1]
-                        logging.info(f"Ряд '{col}' {'стационарен' if pvalue <= 0.05 else 'вероятно нестационарен'} (p-value ADF={pvalue:.3f}).")
-        
-        logging.info(f"[Load] Данные успешно загружены, shape = {df.shape}.")
+def _is_mostly_numeric_row(row) -> bool:
+    """Проверяет, что в строке >=80% непустых значений приводятся к float."""
+    vals = []
+    for v in row:
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        vals.append(v)
+    if not vals:
+        return False
+    numeric = 0
+    for v in vals:
+        try:
+            float(v)
+            numeric += 1
+        except Exception:
+            pass
+    return numeric / max(1, len(vals)) >= 0.8
+
+
+def _detect_header(df_raw: pd.DataFrame) -> bool:
+    """Если 1-я строка нечисловая, а 2-я числовая — считаем 1-ю заголовком."""
+    if df_raw.shape[0] < 2:
+        return False
+    r0 = df_raw.iloc[0].tolist()
+    r1 = df_raw.iloc[1].tolist()
+    return (not _is_mostly_numeric_row(r0)) and _is_mostly_numeric_row(r1)
+
+
+def _maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Поддержка формата: одна колонка строк, внутри ',' ';' '\\t'."""
+    if df_raw.shape[1] == 1 and isinstance(df_raw.iloc[0, 0], str):
+        return df_raw[0].astype(str).str.split(r"[,;\t]", expand=True)
+    return df_raw
+
+
+def _detect_time_like_col(col: pd.Series) -> bool:
+    """Эвристика для авто-обнаружения временной/индексной колонки."""
+    try:
+        dt = pd.to_datetime(col, errors="coerce", utc=False)
+        if dt.notna().mean() >= 0.9:
+            return dt.is_monotonic_increasing or dt.is_monotonic_decreasing
+    except Exception:
+        pass
+
+    c = pd.to_numeric(col, errors="coerce")
+    if c.notna().mean() >= 0.95:
+        dif = c.dropna().diff().dropna()
+        if len(dif) >= 3 and (dif.abs() > 0).mean() >= 0.9:
+            return True
+    return False
+
+
+def read_input_table(filepath: str, header: str = "auto") -> pd.DataFrame:
+    """Чтение CSV/XLSX с поддержкой автодетекта заголовка и одной строковой колонки."""
+    fp = str(filepath)
+    if fp.lower().endswith(".csv"):
+        df0 = pd.read_csv(fp, header=None)
+    else:
+        df0 = pd.read_excel(fp, header=None)
+    df0 = _maybe_split_single_column(df0)
+
+    if header not in {"auto", "yes", "no"}:
+        raise ValueError("header must be one of: auto|yes|no")
+    has_header = _detect_header(df0) if header == "auto" else (header == "yes")
+    if has_header:
+        hdr = df0.iloc[0].astype(str).tolist()
+        df = df0.iloc[1:].copy()
+        df.columns = [h if h.strip() else f"c{i+1}" for i, h in enumerate(hdr)]
+    else:
+        df = df0.copy()
+        df.columns = [f"c{i+1}" for i in range(df.shape[1])]
+    return df
+
+
+def tidy_timeseries_table(
+    df: pd.DataFrame,
+    time_col: str = "auto",
+    transpose: str = "auto",
+) -> pd.DataFrame:
+    """Превращает сырую таблицу в numeric матрицу вида time × features."""
+    out = df.copy()
+    out = out.dropna(axis=1, how="all")
+
+    if time_col not in {"auto", "none"} and time_col not in out.columns:
+        raise ValueError(f"time_col '{time_col}' not found in columns")
+    if time_col == "auto":
+        if out.shape[1] >= 2 and _detect_time_like_col(out.iloc[:, 0]):
+            out = out.iloc[:, 1:].copy()
+    elif time_col != "none":
+        out = out.drop(columns=[time_col])
+
+    out = out.apply(pd.to_numeric, errors="coerce")
+    good = [c for c in out.columns if out[c].notna().mean() >= 0.2]
+    out = out[good]
+
+    if transpose not in {"auto", "yes", "no"}:
+        raise ValueError("transpose must be one of: auto|yes|no")
+    do_t = (out.shape[0] < out.shape[1]) if transpose == "auto" else (transpose == "yes")
+    if do_t:
+        out = out.T
+        out.columns = [f"c{i+1}" for i in range(out.shape[1])]
+
+    out = out.dropna(axis=0, how="all")
+    return out
+
+
+def preprocess_timeseries(
+    df: pd.DataFrame,
+    *,
+    enabled: bool = True,
+    log_transform: bool = False,
+    remove_outliers: bool = True,
+    normalize: bool = True,
+    fill_missing: bool = True,
+    check_stationarity: bool = False,
+) -> pd.DataFrame:
+    """Предобработка матрицы (можно полностью отключить enabled=False)."""
+    out = df.copy()
+    if not enabled:
+        logging.info("[Preprocess] disabled: using raw numeric matrix as-is.")
+        return out
+
+    out = additional_preprocessing(out)
+    out = out.fillna(out.mean(numeric_only=True))
+
+    if log_transform:
+        out = out.applymap(lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x)
+
+    if remove_outliers:
+        for col in out.columns:
+            if pd.api.types.is_numeric_dtype(out[col]):
+                series = out[col]
+                mean, std = series.mean(skipna=True), series.std(skipna=True)
+                if std > 0:
+                    upper, lower = mean + DEFAULT_OUTLIER_Z * std, mean - DEFAULT_OUTLIER_Z * std
+                    outliers = (series < lower) | (series > upper)
+                    if outliers.any():
+                        out.loc[outliers, col] = np.nan
+
+    if fill_missing:
+        out = out.interpolate(method="linear", limit_direction="both", axis=0).bfill().ffill().fillna(0)
+
+    if normalize:
+        cols_to_norm = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+        if cols_to_norm:
+            scaler = StandardScaler()
+            out[cols_to_norm] = scaler.fit_transform(out[cols_to_norm])
+
+    if check_stationarity:
+        for col in out.columns:
+            if pd.api.types.is_numeric_dtype(out[col]):
+                series = out[col].dropna()
+                if len(series) > 10:
+                    pvalue = adfuller(series, autolag="AIC")[1]
+                    logging.info(
+                        f"Ряд '{col}' {'стационарен' if pvalue <= 0.05 else 'вероятно нестационарен'} (p-value ADF={pvalue:.3f})."
+                    )
+    return out
+
+
+def load_or_generate(
+    filepath: str,
+    *,
+    header: str = "auto",
+    time_col: str = "auto",
+    transpose: str = "auto",
+    preprocess: bool = True,
+    log_transform: bool = False,
+    remove_outliers: bool = True,
+    normalize: bool = True,
+    fill_missing: bool = True,
+    check_stationarity: bool = False,
+) -> pd.DataFrame:
+    try:
+        raw = read_input_table(filepath, header=header)
+        df = tidy_timeseries_table(raw, time_col=time_col, transpose=transpose)
+        df = preprocess_timeseries(
+            df,
+            enabled=preprocess,
+            log_transform=log_transform,
+            remove_outliers=remove_outliers,
+            normalize=normalize,
+            fill_missing=fill_missing,
+            check_stationarity=check_stationarity,
+        )
+        logging.info(
+            f"[Load] OK shape={df.shape} header={header} time_col={time_col} transpose={transpose} preprocess={preprocess}"
+        )
         return df
     except Exception as e:
         logging.error(f"[Load] Ошибка загрузки: {e}")
-        raise e
+        raise
 
 ##############################################
 # Функции-метрики
@@ -688,6 +832,16 @@ def compute_partial_granger_matrix(data: pd.DataFrame, lags=DEFAULT_MAX_LAG) -> 
                 pg_matrix[i, j] = gc_val
     return pg_matrix
 
+def p_to_score(p: float, eps: float = 1e-300) -> float:
+    """Convert p-value to comparable strength score: -log10(p). Higher = stronger."""
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return np.nan
+    p = float(p)
+    if p <= 0:
+        p = eps
+    return float(-np.log10(p))
+
+
 def granger_matrix(df: pd.DataFrame, granger_dict_result: dict) -> np.ndarray:
     cols = list(df.columns)
     n_vars = len(cols)
@@ -1178,7 +1332,7 @@ METHOD_INFO: Dict[str, Dict[str, str]] = {
     "h2_partial": {"title": "H2 (partial)", "meaning": "H2 при контроле. Обычно в [0, 1]. Больше = сильнее."},
     "h2_directed": {"title": "H2 (directed)", "meaning": "Направленная H2. Больше = сильнее."},
     "granger_full": {"title": "Granger (p-values)", "meaning": "p-value теста. Меньше = сильнее свидетельство причинности."},
-    "granger_partial": {"title": "Granger partial (p-values)", "meaning": "p-value после удаления влияния control. Меньше = сильнее."},
+    "granger_partial": {"title": "Granger partial (p-values)", "meaning": "Granger partial (linear control; best lag up to L): p-value после удаления влияния control. Меньше = сильнее."},
     "granger_directed": {"title": "Granger directed (p-values)", "meaning": "То же семейство p-values. Меньше = сильнее."},
     "te_full": {"title": "Transfer Entropy", "meaning": "Направленный поток информации. Больше = сильнее."},
     "te_partial": {"title": "Transfer Entropy (partial)", "meaning": "TE при контроле. Больше = сильнее."},
@@ -1608,14 +1762,36 @@ class BigMasterTool:
             return mats.get(frozenset(), None)
         return None
 
-    def load_data_excel(self, filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
-        self.data = load_or_generate(filepath, log_transform, remove_outliers, normalize, fill_missing, check_stationarity)
+    def load_data_excel(
+        self,
+        filepath: str,
+        *,
+        header: str = "auto",
+        time_col: str = "auto",
+        transpose: str = "auto",
+        preprocess: bool = True,
+        log_transform: bool = False,
+        remove_outliers: bool = True,
+        normalize: bool = True,
+        fill_missing: bool = True,
+        check_stationarity: bool = False,
+    ) -> pd.DataFrame:
+        """Загружает данные из файла и готовит матрицу time×features для расчётов."""
+        self.data = load_or_generate(
+            filepath,
+            header=header,
+            time_col=time_col,
+            transpose=transpose,
+            preprocess=preprocess,
+            log_transform=log_transform,
+            remove_outliers=remove_outliers,
+            normalize=normalize,
+            fill_missing=fill_missing,
+            check_stationarity=check_stationarity,
+        )
         self.raw_data = self.data.copy()
-        self.data_normalized = self.data.copy() # Инициализируем data_normalized СРАЗУ после загрузки
-        if self.data.shape[0] < self.data.shape[1]:
-            self.data = self.data.T
-            self.data.columns = [f'c{i+1}' for i in range(self.data.shape[1])] 
-        self.data = self.data.fillna(self.data.mean())
+        self.data_normalized = self.data.copy()  # В текущей архитектуре "normalized" совпадает с предобработанными данными.
+        self.data = self.data.fillna(self.data.mean(numeric_only=True))
         self.data_type = 'file'
         logging.info(f"[BigMasterTool] Данные загружены, shape = {self.data.shape}.")
         return self.data
@@ -2677,17 +2853,48 @@ class BigMasterTool:
                         continue
                     edges.append((cols[i], cols[j], float(v)))
             if pval:
-                edges.sort(key=lambda x: x[2])
+                # Для p-value методов сортируем по "силе" связи, но пороги интерпретируем по p.
+                edges.sort(key=lambda x: p_to_score(x[2]), reverse=True)
             else:
                 edges.sort(key=lambda x: abs(x[2]), reverse=True)
             return edges[:max_edges]
 
+        def _section_anchor_title(variant: str, default_title: str) -> Tuple[str, str]:
+            """Возвращает якорь/заголовок для секции метода в HTML-отчёте."""
+            v = variant.lower()
+            if v == "correlation_partial":
+                return "pcorr_block", "Partial correlation (КПК)"
+            if v.startswith("correlation"):
+                return "corr_block", "Correlation"
+            if v == "mutinf_full":
+                return "mi_block", "Mutual information"
+            if v == "mutinf_partial":
+                return "cmi_block", "Conditional mutual information (КЧК)"
+            if v.startswith("te_"):
+                return "te_block", "Transfer entropy"
+            return variant, default_title
+
         cols = list(df.columns)
         toc_items = []
-        sections = []
+        sections = [
+            (
+                "<section id='data_summary'>"
+                "<h2 id='data_summary'>Data summary</h2>"
+                f"<div class='muted'>Rows: {len(df)} • Columns: {len(cols)} • Variants: {len(variants)}</div>"
+                "</section>"
+            )
+        ]
+        used_section_ids = {"data_summary"}
         for v in variants:
             info = METHOD_INFO.get(v, {"title": v, "meaning": ""})
-            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(info['title'])}</a></li>")
+            section_id, section_title = _section_anchor_title(v, info["title"])
+            if section_id in used_section_ids:
+                i = 2
+                while f"{section_id}_{i}" in used_section_ids:
+                    i += 1
+                section_id = f"{section_id}_{i}"
+            used_section_ids.add(section_id)
+            toc_items.append(f"<li><a href='#{_html.escape(section_id)}'>{_html.escape(section_title)}</a></li>")
 
             lag_block = ""
             if v in self.lag_results and self.lag_results[v]:
@@ -2724,20 +2931,33 @@ class BigMasterTool:
             edges_html = ["<ol class='edges'>"]
             for a, b, val in edges:
                 if is_pvalue_method(v):
-                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: p={val:.4g}</li>")
+                    score = p_to_score(val)
+                    line = f"{_html.escape(a)} → {_html.escape(b)}: p = {val:.4g}, score = {score:.3f}"
+                    edges_html.append(f"<li>{line}</li>")
                 else:
                     edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: {val:.4g}</li>" if is_directed_method(v)
                                      else f"<li>{_html.escape(a)} — {_html.escape(b)}: {val:.4g}</li>")
             edges_html.append("</ol>")
 
             table_html = _matrix_to_html(mat1, cols) if include_matrix_tables else "<div class='muted'>matrix table disabled</div>"
+            te_params_block = ""
+            if v.lower().startswith("te_"):
+                lag_max = max(self.lag_ranges.get(v, range(1, 2)))
+                te_k = DEFAULT_BINS
+                te_l = 1
+                n_rows = len(df)
+                te_params_block = (
+                    f"<p><b>TE parameters:</b> k={te_k}, l={te_l}, lag_max={lag_max}, N={n_rows}</p>"
+                )
 
             sections.append(
-                f"<section id='{_html.escape(v)}'>"
-                f"<h2>{_html.escape(info['title'])}</h2>"
+                f"<section id='{_html.escape(section_id)}'>"
+                f"<h2 id='{_html.escape(section_id)}'>{_html.escape(section_title)}</h2>"
                 f"<div class='muted'>{_html.escape(info.get('meaning',''))}</div>"
                 f"{lag_block}"
-                f"<div class='grid'>{heat_html}{conn_html}</div>"
+                f"{te_params_block}"
+                f"<h3>Matrix (heatmap)</h3>{heat_html}"
+                f"<h3>Connectome graph</h3>{conn_html}"
                 f"<h3>Top edges</h3>{''.join(edges_html)}"
                 f"<h3>Matrix (Lag=1)</h3>{table_html}"
                 f"</section>"
@@ -2770,6 +2990,17 @@ class BigMasterTool:
   </style>
 </head>
 <body>
+  <div style="position:fixed; right:20px; top:20px; width:260px;
+              background:#f7f7f7; color:#111; border:1px solid #ccc; padding:12px;
+              font-family:Arial; font-size:14px; z-index:9999; border-radius:8px;">
+    <b>Contents</b><br>
+    <a href="#data_summary">Data summary</a><br>
+    <a href="#corr_block">Correlation</a><br>
+    <a href="#mi_block">Mutual information</a><br>
+    <a href="#pcorr_block">Partial correlation (КПК)</a><br>
+    <a href="#cmi_block">Conditional MI (КЧК)</a><br>
+    <a href="#te_block">Transfer entropy</a><br>
+  </div>
   <header>
     <div style="font-size:18px; font-weight:700;">Time Series Connectivity Report</div>
     <div class="muted">Методы: {len(variants)} • Переменные: {len(cols)} • Длина ряда: {len(df)}</div>
@@ -2854,14 +3085,48 @@ class BigMasterTool:
                     if np.isnan(v):
                         continue
                     edges.append((cols_[i], cols_[j], float(v)))
-            edges.sort(key=(lambda x: x[2]) if pval else (lambda x: abs(x[2])), reverse=not pval)
+            if pval:
+                # Для p-value методов сортируем по -log10(p), чтобы Top edges были визуально сопоставимыми.
+                edges.sort(key=lambda x: p_to_score(x[2]), reverse=True)
+            else:
+                edges.sort(key=lambda x: abs(x[2]), reverse=True)
             return edges[:max_edges]
 
+        def _section_anchor_title(variant: str, default_title: str) -> Tuple[str, str]:
+            """Возвращает якорь/заголовок для секции метода в mini-site отчёте."""
+            v = variant.lower()
+            if v == "correlation_partial":
+                return "pcorr_block", "Partial correlation (КПК)"
+            if v.startswith("correlation"):
+                return "corr_block", "Correlation"
+            if v == "mutinf_full":
+                return "mi_block", "Mutual information"
+            if v == "mutinf_partial":
+                return "cmi_block", "Conditional mutual information (КЧК)"
+            if v.startswith("te_"):
+                return "te_block", "Transfer entropy"
+            return variant, default_title
+
         toc_items = []
-        sections = []
+        sections = [
+            (
+                "<section id='data_summary'>"
+                "<h2 id='data_summary'>Data summary</h2>"
+                f"<div class='muted'>Rows: {len(df)} • Columns: {len(cols)} • Variants: {len(variants)}</div>"
+                "</section>"
+            )
+        ]
+        used_section_ids = {"data_summary"}
         for v in variants:
             info = METHOD_INFO.get(v, {"title": v, "meaning": ""})
-            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(info['title'])}</a></li>")
+            section_id, section_title = _section_anchor_title(v, info["title"])
+            if section_id in used_section_ids:
+                i = 2
+                while f"{section_id}_{i}" in used_section_ids:
+                    i += 1
+                section_id = f"{section_id}_{i}"
+            used_section_ids.add(section_id)
+            toc_items.append(f"<li><a href='#{_html.escape(section_id)}'>{_html.escape(section_title)}</a></li>")
 
             mat1 = self.results.get(v)
             if mat1 is None:
@@ -2884,18 +3149,31 @@ class BigMasterTool:
             edges_html = ["<ol class='edges'>"]
             for a, b, val in edges:
                 if is_pvalue_method(v):
-                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: p={val:.4g}</li>")
+                    score = p_to_score(val)
+                    line = f"{_html.escape(a)} → {_html.escape(b)}: p = {val:.4g}, score = {score:.3f}"
+                    edges_html.append(f"<li>{line}</li>")
                 else:
                     edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: {val:.4g}</li>" if is_directed_method(v)
                                      else f"<li>{_html.escape(a)} — {_html.escape(b)}: {val:.4g}</li>")
             edges_html.append("</ol>")
 
             table_html = _matrix_to_html(mat1, cols) if include_matrix_tables else "<div class='muted'>matrix table disabled</div>"
+            te_params_block = ""
+            if v.lower().startswith("te_"):
+                lag_max = max(self.lag_ranges.get(v, range(1, 2)))
+                te_k = DEFAULT_BINS
+                te_l = 1
+                n_rows = len(df)
+                te_params_block = (
+                    f"<p><b>TE parameters:</b> k={te_k}, l={te_l}, lag_max={lag_max}, N={n_rows}</p>"
+                )
             sections.append(
-                f"<section id='{_html.escape(v)}'>"
-                f"<h2>{_html.escape(info['title'])}</h2>"
+                f"<section id='{_html.escape(section_id)}'>"
+                f"<h2 id='{_html.escape(section_id)}'>{_html.escape(section_title)}</h2>"
                 f"<div class='muted'>{_html.escape(info.get('meaning',''))}</div>"
-                f"<div class='grid'><img class='img' src='{heat_path}'/><img class='img' src='{conn_path}'/></div>"
+                f"{te_params_block}"
+                f"<h3>Matrix (heatmap)</h3><img class='img' src='{heat_path}'/>"
+                f"<h3>Connectome graph</h3><img class='img' src='{conn_path}'/>"
                 f"<h3>Top edges</h3>{''.join(edges_html)}"
                 f"<h3>Matrix (Lag=1)</h3>{table_html}"
                 f"</section>"
@@ -2927,6 +3205,17 @@ class BigMasterTool:
   </style>
 </head>
 <body>
+  <div style="position:fixed; right:20px; top:20px; width:260px;
+              background:#f7f7f7; color:#111; border:1px solid #ccc; padding:12px;
+              font-family:Arial; font-size:14px; z-index:9999; border-radius:8px;">
+    <b>Contents</b><br>
+    <a href="#data_summary">Data summary</a><br>
+    <a href="#corr_block">Correlation</a><br>
+    <a href="#mi_block">Mutual information</a><br>
+    <a href="#pcorr_block">Partial correlation (КПК)</a><br>
+    <a href="#cmi_block">Conditional MI (КЧК)</a><br>
+    <a href="#te_block">Transfer entropy</a><br>
+  </div>
   <header>
     <div style="font-size:18px; font-weight:700;">Time Series Connectivity Report</div>
     <div class="muted">Методы: {len(variants)} • Переменные: {len(cols)} • Длина ряда: {len(df)}</div>
