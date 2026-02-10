@@ -9,11 +9,13 @@ import importlib
 import importlib.util
 import logging
 import os
+import shutil
 import warnings
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from itertools import chain, combinations, permutations
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use('Agg')
@@ -1079,7 +1081,7 @@ method_mapping = {
     # ——— Granger causality ———
     "granger_full":         lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
     "granger_partial":      lambda data, lag, control=None: granger_matrix_partial(data, maxlag=lag, control=control), 
-    "granger_directed":     lambda data, lag, control=None: compute_partial_granger_matrix(data, lags=lag),
+    "granger_directed":     lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
 # ...
 
     # ——— Transfer entropy ———
@@ -1107,33 +1109,92 @@ class MethodSpec:
     supports_lag: bool
     description: str = ""
 
-# ВАЖНО: конвенция для directed-матриц — M[src, tgt]
-PVAL_METHODS = {"granger_full", "granger_partial"}          # матрица p-value (меньше => сильнее)
+# -----------------------------
+# Метод-метаданные и логика
+# -----------------------------
+
+# p-value методы: меньше = сильнее свидетельство связи (нужно invert_threshold=True)
+PVAL_METHODS = {
+    "granger_full",
+    "granger_partial",
+    "granger_directed",
+}
+
+# directed методы: матрица A[i,j] интерпретируется как i -> j
 DIRECTED_METHODS = {
-    "correlation_directed", "h2_directed",
-    "granger_full", "granger_partial", "granger_directed",
-    "te_full", "te_partial", "te_directed",
-    "ah_full", "ah_partial", "ah_directed",
+    "correlation_directed",
+    "h2_directed",
+    "granger_full",
+    "granger_partial",
+    "granger_directed",
+    "te_full",
+    "te_partial",
+    "te_directed",
+    "ah_full",
+    "ah_partial",
+    "ah_directed",
+}
+
+
+def is_pvalue_method(variant: str) -> bool:
+    return variant.lower() in PVAL_METHODS
+
+
+def is_directed_method(variant: str) -> bool:
+    return variant.lower() in DIRECTED_METHODS
+
+
+def is_control_sensitive_method(variant: str) -> bool:
+    # сейчас "partial" = методы с контролем; остальные control игнорируют
+    return "_partial" in variant.lower()
+
+
+METHOD_INFO: Dict[str, Dict[str, str]] = {
+    "correlation_full": {
+        "title": "Корреляция (полная)",
+        "meaning": "Линейная связь. Значение в [-1, 1]. |value| ближе к 1 = сильнее.",
+    },
+    "correlation_partial": {
+        "title": "Частичная корреляция",
+        "meaning": "Линейная связь при контроле остальных переменных. [-1, 1].",
+    },
+    "correlation_directed": {
+        "title": "Лаговая корреляция (directed)",
+        "meaning": "Оценка направленной связи через сдвиг по лагу. Чем больше |value|, тем сильнее.",
+    },
+    "mutinf_full": {
+        "title": "Взаимная информация (MI)",
+        "meaning": "Нелинейная зависимость. >= 0. Больше = сильнее.",
+    },
+    "mutinf_partial": {
+        "title": "Частичная MI",
+        "meaning": "MI при контроле переменных. >= 0. Больше = сильнее.",
+    },
+    "coherence_full": {
+        "title": "Когерентность",
+        "meaning": "Частотная синхронизация. Обычно в [0, 1]. Больше = сильнее.",
+    },
+    "h2_full": {"title": "H2 (полная)", "meaning": "Нелинейная связность. Обычно в [0, 1]. Больше = сильнее."},
+    "h2_partial": {"title": "H2 (partial)", "meaning": "H2 при контроле. Обычно в [0, 1]. Больше = сильнее."},
+    "h2_directed": {"title": "H2 (directed)", "meaning": "Направленная H2. Больше = сильнее."},
+    "granger_full": {"title": "Granger (p-values)", "meaning": "p-value теста. Меньше = сильнее свидетельство причинности."},
+    "granger_partial": {"title": "Granger partial (p-values)", "meaning": "p-value после удаления влияния control. Меньше = сильнее."},
+    "granger_directed": {"title": "Granger directed (p-values)", "meaning": "То же семейство p-values. Меньше = сильнее."},
+    "te_full": {"title": "Transfer Entropy", "meaning": "Направленный поток информации. Больше = сильнее."},
+    "te_partial": {"title": "Transfer Entropy (partial)", "meaning": "TE при контроле. Больше = сильнее."},
+    "te_directed": {"title": "Transfer Entropy (directed)", "meaning": "TE (directed). Больше = сильнее."},
+    "ah_full": {"title": "AH (directed)", "meaning": "Нелинейная направленная мера. Больше = сильнее."},
+    "ah_partial": {"title": "AH (partial)", "meaning": "AH при контроле. Больше = сильнее."},
+    "ah_directed": {"title": "AH (directed)", "meaning": "AH (directed). Больше = сильнее."},
 }
 
 
 def _is_pvalue_method(variant: str) -> bool:
-    return variant in PVAL_METHODS
+    return is_pvalue_method(variant)
 
 
 def _is_directed_method(variant: str) -> bool:
-    return variant in DIRECTED_METHODS
-
-
-def is_pvalue_method(name: str) -> bool:
-    """Публичный алиас для p-value семантики метода."""
-    return _is_pvalue_method(name)
-
-
-def is_directed_method(name: str) -> bool:
-    """Публичный алиас для направленности метода."""
-    return _is_directed_method(name)
-
+    return is_directed_method(variant)
 
 def _lag_quality(variant: str, mat: np.ndarray) -> float:
     """Скалярная метрика качества лага: больше => лучше (единая конвенция)."""
@@ -1157,10 +1218,10 @@ def _lag_quality(variant: str, mat: np.ndarray) -> float:
 def get_method_spec(variant: str) -> MethodSpec:
     """Совместимость со старым API: возвращает MethodSpec на основе новых семантических множеств."""
     return MethodSpec(
-        directed=_is_directed_method(variant),
-        is_p_value=_is_pvalue_method(variant),
-        control_dependent=("partial" in variant),
-        supports_lag=_is_directed_method(variant),
+        directed=is_directed_method(variant),
+        is_p_value=is_pvalue_method(variant),
+        control_dependent=is_control_sensitive_method(variant),
+        supports_lag=is_directed_method(variant),
     )
 
 def compute_connectivity_variant(data, variant, lag=1, control=None):
@@ -1526,6 +1587,27 @@ class BigMasterTool:
         self.undirected_methods = [m for m in method_mapping if not get_method_spec(m).directed]
         self.directed_methods = [m for m in method_mapping if get_method_spec(m).directed]
 
+    def _ensure_pairwise_cache(self) -> None:
+        """
+        Ленивая подготовка тяжёлых pairwise-таблиц (Undirected/Directed Methods).
+        """
+        if self.data_normalized.empty:
+            self.normalize_data()
+        if not self.undirected_rows or not self.directed_rows:
+            self.prepare_pairs()
+        if not self.connectivity_matrices:
+            self.compute_all_matrices()
+
+    def _get_cached_matrix(self, method: str, control_set: List[str]) -> Optional[np.ndarray]:
+        mats = self.connectivity_matrices.get(method, {})
+        key = frozenset(control_set) if control_set else frozenset()
+        if key in mats:
+            return mats[key]
+        # если метод не зависит от control, используем базовую матрицу
+        if not is_control_sensitive_method(method):
+            return mats.get(frozenset(), None)
+        return None
+
     def load_data_excel(self, filepath: str, log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> pd.DataFrame:
         self.data = load_or_generate(filepath, log_transform, remove_outliers, normalize, fill_missing, check_stationarity)
         self.raw_data = self.data.copy()
@@ -1606,23 +1688,35 @@ class BigMasterTool:
         return self.optimize_lag(variant, c_lags)
 
     def compute_all_matrices(self):
-        if self.data_normalized.empty: self.normalize_data()
+        if self.data_normalized.empty:
+            self.normalize_data()
         if self.data_normalized.empty:
             logging.warning("[Matrices] Нет данных для вычисления матриц.")
             return
+        # Готовим пары заранее и считаем только реально нужные control-set’ы
+        if not hasattr(self, "undirected_rows") or not hasattr(self, "directed_rows"):
+            self.prepare_pairs()
+        if not getattr(self, "undirected_rows", None) or not getattr(self, "directed_rows", None):
+            self.prepare_pairs()
 
-        self.all_control_sets = [list(s) for s in powerset(self.data_normalized.columns)]
+        required = set()
+        for _, S in getattr(self, "undirected_rows", []):
+            required.add(frozenset(S))
+        for _, S in getattr(self, "directed_rows", []):
+            required.add(frozenset(S))
+        if not required:
+            required = {frozenset(s) for s in powerset(self.data_normalized.columns)}
+
+        self.all_control_sets = [list(s) for s in sorted(required, key=lambda x: (len(x), sorted(list(x))))]
         self.connectivity_matrices = {}
         for method in method_mapping.keys():
             self.connectivity_matrices[method] = {}
-            spec = get_method_spec(method)
-            if spec.control_dependent:
+            if is_control_sensitive_method(method):
                 for S in self.all_control_sets:
                     mat = compute_connectivity_variant(self.data_normalized, method, lag=1, control=S)
                     if mat is not None:
                         self.connectivity_matrices[method][frozenset(S)] = mat
             else:
-                # Метод не зависит от control set: достаточно одного расчёта.
                 mat = compute_connectivity_variant(self.data_normalized, method, lag=1, control=None)
                 if mat is not None:
                     self.connectivity_matrices[method][frozenset()] = mat
@@ -1987,10 +2081,7 @@ class BigMasterTool:
             S_str = ",".join(S) if S else "None"
             vals = [pair_str, S_str]
             for method in self.undirected_methods:
-                mats = self.connectivity_matrices.get(method, {})
-                mat = mats.get(frozenset(S), None)
-                if mat is None:
-                    mat = mats.get(frozenset(), None)
+                mat = self._get_cached_matrix(method, S)
                 if mat is not None:
                     v = self.get_undirected_value(mat, pair[0], pair[1], indices)
                     vals.append(fmt_val(v))
@@ -2002,9 +2093,8 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        spec = get_method_spec(method)
-                        if spec.is_p_value:
-                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
+                        if is_pvalue_method(method):
+                            cell.fill = fill_green if v < p_value_alpha else fill_pink
                         else:
                             cell.fill = fill_green if abs(v) >= threshold else fill_pink
                     except:
@@ -2026,10 +2116,7 @@ class BigMasterTool:
             S_str = ",".join(S) if S else "None"
             vals = [pair_str, S_str]
             for method in self.directed_methods:
-                mats = self.connectivity_matrices.get(method, {})
-                mat = mats.get(frozenset(S), None)
-                if mat is None:
-                    mat = mats.get(frozenset(), None)
+                mat = self._get_cached_matrix(method, S)
                 if mat is not None:
                     v = self.get_directed_value(mat, pair[0], pair[1], indices)
                     vals.append(fmt_val(v))
@@ -2041,9 +2128,8 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        spec = get_method_spec(method)
-                        if spec.is_p_value:
-                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
+                        if is_pvalue_method(method):
+                            cell.fill = fill_green if v < p_value_alpha else fill_pink
                         else:
                             cell.fill = fill_green if abs(v) >= threshold else fill_pink
                     except:
@@ -2065,7 +2151,7 @@ class BigMasterTool:
 
 
     def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, window_size: int, overlap: int, p_value_alpha: float = 0.05) -> None:
-        directed_flag = (variant in self.directed_methods) or is_directed_method(variant)
+        directed_flag = is_directed_method(variant)
         is_pval = is_pvalue_method(variant)
         edge_threshold = p_value_alpha if is_pval else threshold
         invert_threshold = True if is_pval else False
@@ -2331,13 +2417,15 @@ class BigMasterTool:
             ws.add_image(img, cell)
 
     def export_big_excel(self, save_path: str = "AllMethods_Full.xlsx", threshold: float = 0.2, p_value_alpha: float = DEFAULT_PVALUE_ALPHA, window_size: int = 100, overlap: int = 50,
-                           log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False) -> str:
+                           log_transform=False, remove_outliers=True, normalize=True, fill_missing=True, check_stationarity=False, include_pairwise_sheets: bool = True) -> str:
         wb = Workbook()
         wb.remove(wb.active)
         add_raw_data_sheet(wb, self.data) 
         self.export_summary_sheet(wb, graph_threshold=threshold, p_value_alpha=p_value_alpha)
-        self.export_undirected_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
-        self.export_directed_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
+        if include_pairwise_sheets:
+            self._ensure_pairwise_cache()
+            self.export_undirected_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
+            self.export_directed_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
         ws_diag = wb.create_sheet("Data & Diagnostics")
         ws_diag.append(["Диагностика (Original) с информацией о сезонности"])
         for c in self.data.columns:
@@ -2517,7 +2605,7 @@ class BigMasterTool:
             if matrix is not None:
                 is_directed = is_directed_method(method_variant)
                 is_pval = is_pvalue_method(method_variant)
-                threshold = 0.05 if is_pval else 0.5
+                threshold = 0.05 if is_pval else 0.2
                 invert_threshold = True if is_pval else False
 
                 title = f"{report_label}"
@@ -2531,125 +2619,339 @@ class BigMasterTool:
 
 
     # -----------------------------
-    # Self-contained HTML отчёт
+    # HTML / Site report
     # -----------------------------
     def export_html_report(
         self,
         output_path: str,
+        variants: Optional[List[str]] = None,
         graph_threshold: float = 0.2,
-        p_value_alpha: float = 0.05,
-        methods: Optional[List[str]] = None,
-        include_images: bool = True,
+        p_alpha: float = 0.05,
+        embed_images: bool = True,
+        include_matrix_tables: bool = True,
+        max_edges: int = 25,
     ) -> str:
-        if self.data_normalized.empty:
-            self.normalize_data()
-        df_for_analysis = self.data_normalized[[c for c in self.data_normalized.columns if c.startswith("c")]]
-        if df_for_analysis.empty:
-            raise ValueError("Нет колонок c* для анализа (df_for_analysis пуст).")
+        if not self.results:
+            self.run_all_methods()
+        df = self.data_normalized if not self.data_normalized.empty else self.data
+        variants = variants or [v for v in STABLE_METHODS if v in method_mapping]
 
-        methods = methods or list(method_mapping.keys())
-        cols = list(df_for_analysis.columns)
+        def _b64_png(buf: BytesIO) -> str:
+            return base64.b64encode(buf.getvalue()).decode("ascii")
 
-        def _buf_to_data_uri(buf: BytesIO) -> str:
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            return f"data:image/png;base64,{b64}"
+        def _matrix_to_html(mat: np.ndarray, cols: List[str]) -> str:
+            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+                return "<div class='muted'>No data</div>"
+            out = ["<table class='matrix'><thead><tr><th></th>"]
+            for c in cols:
+                out.append(f"<th>{_html.escape(str(c))}</th>")
+            out.append("</tr></thead><tbody>")
+            for i, rname in enumerate(cols):
+                out.append(f"<tr><th>{_html.escape(str(rname))}</th>")
+                for j in range(len(cols)):
+                    v = mat[i, j]
+                    if np.isnan(v):
+                        s = "NaN"
+                    else:
+                        s = f"{v:.4g}"
+                    out.append(f"<td>{_html.escape(s)}</td>")
+                out.append("</tr>")
+            out.append("</tbody></table>")
+            return "".join(out)
 
-        def _matrix_html(mat: np.ndarray) -> str:
-            if mat is None:
-                return "<p><em>Нет данных (матрица None).</em></p>"
-            d = pd.DataFrame(mat, index=cols, columns=cols)
-            return d.to_html(border=0, escape=True, float_format=lambda x: f"{x:.4g}")
+        def _top_edges(mat: np.ndarray, cols: List[str], variant: str) -> List[Tuple[str, str, float]]:
+            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+                return []
+            edges = []
+            n = len(cols)
+            directed = is_directed_method(variant)
+            pval = is_pvalue_method(variant)
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    if not directed and j <= i:
+                        continue
+                    v = mat[i, j]
+                    if np.isnan(v):
+                        continue
+                    edges.append((cols[i], cols[j], float(v)))
+            if pval:
+                edges.sort(key=lambda x: x[2])
+            else:
+                edges.sort(key=lambda x: abs(x[2]), reverse=True)
+            return edges[:max_edges]
 
-        def _interpretation(variant: str) -> str:
-            if _is_pvalue_method(variant):
-                return (
-                    "<p><b>Семантика:</b> элементы — p-value для проверки Granger src→tgt. "
-                    f"Рёбра рисуются при p &lt; {p_value_alpha:g}. Меньше p — сильнее свидетельство.</p>"
-                )
-            if variant.startswith("correlation"):
-                return "<p><b>Семантика:</b> корреляция (знак важен), рёбра по |w| ≥ threshold.</p>"
-            if variant.startswith("h2"):
-                return "<p><b>Семантика:</b> H² = corr² (0..1), рёбра по w ≥ threshold.</p>"
-            if variant.startswith("mutual_info") or variant.startswith("mutinf"):
-                return "<p><b>Семантика:</b> взаимная информация (≥0), рёбра по w ≥ threshold.</p>"
-            if variant.startswith("coherence"):
-                return "<p><b>Семантика:</b> средняя когерентность (0..1), рёбра по w ≥ threshold.</p>"
-            if variant.startswith("te"):
-                return "<p><b>Семантика:</b> transfer entropy src→tgt (≥0), рёбра по w ≥ threshold.</p>"
-            if variant.startswith("ah"):
-                return "<p><b>Семантика:</b> AH-направленность src→tgt (0..1), рёбра по w ≥ threshold.</p>"
-            if variant == "granger_directed":
-                return "<p><b>Семантика:</b> VAR-based strength (лог-отношение дисперсий) src→tgt, не p-value.</p>"
-            return "<p><b>Семантика:</b> см. реализацию метода.</p>"
-
-        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        cols = list(df.columns)
         toc_items = []
         sections = []
+        for v in variants:
+            info = METHOD_INFO.get(v, {"title": v, "meaning": ""})
+            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(info['title'])}</a></li>")
 
-        sections.append(f"<h1 id='top'>Connectivity Report</h1><p><em>{_html.escape(now)}</em></p>")
-        sections.append(
-            f"<h2 id='data'>Data</h2>"
-            f"<p>Rows: {len(df_for_analysis)}, Vars: {len(cols)} ({', '.join(map(_html.escape, cols))})</p>"
-        )
+            lag_block = ""
+            if v in self.lag_results and self.lag_results[v]:
+                best_lag, median_lag, _ = self.select_lag_metrics(self.lag_results[v], v)
+                lag_block = (
+                    f"<div class='kv'>"
+                    f"<div><b>Best lag</b>: {best_lag}</div>"
+                    f"<div><b>Median lag</b>: {median_lag}</div>"
+                    f"</div>"
+                )
 
-        sections.append("<h2 id='methods'>Methods</h2>")
-        for v in methods:
-            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(v)}</a></li>")
-        sections.append("<ul>" + "".join(toc_items) + "</ul>")
+            mat1 = self.results.get(v)
+            if mat1 is None:
+                mat1 = compute_connectivity_variant(df, v, lag=1, control=None)
 
-        for variant in methods:
-            is_pval = is_pvalue_method(variant)
-            is_dir = _is_directed_method(variant)
-            thr = p_value_alpha if is_pval else graph_threshold
-            inv = True if is_pval else False
+            heat = plot_heatmap(mat1, f"{v} heatmap", legend_text="Lag=1")
+            thr = p_alpha if is_pvalue_method(v) else graph_threshold
+            conn = plot_connectome(
+                mat1,
+                f"{v} connectome",
+                threshold=thr,
+                directed=is_directed_method(v),
+                invert_threshold=is_pvalue_method(v),
+                legend_text=f"Lag=1; thr={thr}",
+            )
+            if embed_images:
+                heat_html = f"<img class='img' src='data:image/png;base64,{_b64_png(heat)}'/>"
+                conn_html = f"<img class='img' src='data:image/png;base64,{_b64_png(conn)}'/>"
+            else:
+                heat_html = "<div class='muted'>embed_images=False</div>"
+                conn_html = "<div class='muted'>embed_images=False</div>"
 
-            lag = 1
-            mat = None
-            if hasattr(self, "lag_results") and variant in self.lag_results and self.lag_results[variant]:
-                best_lag, _, _ = self.select_lag_metrics(self.lag_results[variant], variant)
-                if best_lag is not None:
-                    lag = int(best_lag)
-                    mat = self.lag_results[variant][best_lag][1]
-            if mat is None:
-                mat = compute_connectivity_variant(df_for_analysis, variant, lag=lag, control=None)
+            edges = _top_edges(mat1, cols, v)
+            edges_html = ["<ol class='edges'>"]
+            for a, b, val in edges:
+                if is_pvalue_method(v):
+                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: p={val:.4g}</li>")
+                else:
+                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: {val:.4g}</li>" if is_directed_method(v)
+                                     else f"<li>{_html.escape(a)} — {_html.escape(b)}: {val:.4g}</li>")
+            edges_html.append("</ol>")
 
-            sections.append(f"<hr/><h2 id='{_html.escape(variant)}'>{_html.escape(variant)}</h2>")
-            sections.append(_interpretation(variant))
-            sections.append(f"<p><b>Lag:</b> {lag} &nbsp; <b>Threshold:</b> {thr:g}</p>")
+            table_html = _matrix_to_html(mat1, cols) if include_matrix_tables else "<div class='muted'>matrix table disabled</div>"
 
-            sections.append("<details open><summary><b>Matrix</b></summary>")
-            sections.append(_matrix_html(mat))
-            sections.append("</details>")
+            sections.append(
+                f"<section id='{_html.escape(v)}'>"
+                f"<h2>{_html.escape(info['title'])}</h2>"
+                f"<div class='muted'>{_html.escape(info.get('meaning',''))}</div>"
+                f"{lag_block}"
+                f"<div class='grid'>{heat_html}{conn_html}</div>"
+                f"<h3>Top edges</h3>{''.join(edges_html)}"
+                f"<h3>Matrix (Lag=1)</h3>{table_html}"
+                f"</section>"
+            )
 
-            if include_images and mat is not None:
-                hm = plot_heatmap(mat, f"{variant} heatmap", legend_text=f"lag={lag}")
-                cm = plot_connectome(mat, f"{variant} connectome", threshold=thr, directed=is_dir, invert_threshold=inv, legend_text=f"lag={lag}")
-                sections.append("<div style='display:flex; gap:16px; flex-wrap:wrap'>")
-                sections.append(f"<div><h3>Heatmap</h3><img style='max-width:420px' src='{_buf_to_data_uri(hm)}'/></div>")
-                sections.append(f"<div><h3>Connectome</h3><img style='max-width:420px' src='{_buf_to_data_uri(cm)}'/></div>")
-                sections.append("</div>")
+        html_doc = f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Time Series Connectivity Report</title>
+  <style>
+    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; padding:0; background:#0b0b0c; color:#eaeaea;}}
+    header{{padding:20px 22px; border-bottom:1px solid #222; position:sticky; top:0; background:#0b0b0c; z-index:10;}}
+    main{{display:grid; grid-template-columns: 320px 1fr; gap:18px; padding:18px 22px;}}
+    nav{{border:1px solid #222; border-radius:12px; padding:14px; height:calc(100vh - 110px); overflow:auto;}}
+    nav ul{{margin:0; padding-left:18px;}}
+    a{{color:#8ab4f8; text-decoration:none;}}
+    a:hover{{text-decoration:underline;}}
+    section{{border:1px solid #222; border-radius:12px; padding:16px; margin-bottom:16px; background:#111;}}
+    .muted{{color:#b7b7b7; font-size:13px;}}
+    .grid{{display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px;}}
+    .img{{max-width:100%; border-radius:10px; border:1px solid #222; background:#0b0b0c;}}
+    .matrix{{border-collapse:collapse; width:100%; overflow:auto; display:block;}}
+    .matrix th,.matrix td{{border:1px solid #2a2a2a; padding:6px 8px; font-size:12px; white-space:nowrap;}}
+    .matrix th{{position:sticky; left:0; background:#141414;}}
+    .edges{{font-size:13px;}}
+    .kv{{display:flex; gap:16px; margin-top:8px; font-size:13px;}}
+    @media (max-width: 1000px){{ main{{grid-template-columns: 1fr;}} nav{{height:auto;}} .grid{{grid-template-columns:1fr;}} }}
+  </style>
+</head>
+<body>
+  <header>
+    <div style="font-size:18px; font-weight:700;">Time Series Connectivity Report</div>
+    <div class="muted">Методы: {len(variants)} • Переменные: {len(cols)} • Длина ряда: {len(df)}</div>
+  </header>
+  <main>
+    <nav>
+      <div style="font-weight:700; margin-bottom:8px;">Оглавление</div>
+      <ul>{''.join(toc_items)}</ul>
+    </nav>
+    <div>
+      {''.join(sections)}
+    </div>
+  </main>
+</body>
+</html>"""
 
-        style = """
-        <style>
-          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-          code, pre { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
-          table { border-collapse: collapse; }
-          th, td { padding: 6px 10px; border-bottom: 1px solid #e5e5e5; font-size: 13px; }
-          th { text-align:left; position: sticky; top: 0; background: #fff; }
-          details { margin: 10px 0; }
-        </style>
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(html_doc, encoding="utf-8")
+        logging.info(f"[Export] HTML report saved: {str(out)}")
+        return str(out)
+
+    def export_site_report(
+        self,
+        out_dir: str,
+        variants: Optional[List[str]] = None,
+        graph_threshold: float = 0.2,
+        p_alpha: float = 0.05,
+        include_matrix_tables: bool = True,
+        max_edges: int = 25,
+        zip_path: Optional[str] = None,
+    ) -> str:
         """
-        html_doc = (
-            "<!doctype html><html><head><meta charset='utf-8'/>"
-            "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
-            f"<title>Connectivity Report</title>{style}</head><body>"
-            "<p><a href='#top'>↑ top</a></p>"
-            + "".join(sections)
-            + "</body></html>"
-        )
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html_doc)
-        return output_path
+        Мини-сайт: index.html + assets/*.png. Опционально упаковывает в zip_path.
+        """
+        if not self.results:
+            self.run_all_methods()
+        df = self.data_normalized if not self.data_normalized.empty else self.data
+        variants = variants or [v for v in STABLE_METHODS if v in method_mapping]
+        outp = Path(out_dir)
+        assets = outp / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+
+        cols = list(df.columns)
+
+        def _save_png(buf: BytesIO, name: str) -> str:
+            p = assets / name
+            p.write_bytes(buf.getvalue())
+            return f"assets/{name}"
+
+        def _matrix_to_html(mat: np.ndarray, cols_: List[str]) -> str:
+            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+                return "<div class='muted'>No data</div>"
+            out = ["<table class='matrix'><thead><tr><th></th>"]
+            for c in cols_:
+                out.append(f"<th>{_html.escape(str(c))}</th>")
+            out.append("</tr></thead><tbody>")
+            for i, rname in enumerate(cols_):
+                out.append(f"<tr><th>{_html.escape(str(rname))}</th>")
+                for j in range(len(cols_)):
+                    v = mat[i, j]
+                    s = "NaN" if np.isnan(v) else f"{v:.4g}"
+                    out.append(f"<td>{_html.escape(s)}</td>")
+                out.append("</tr>")
+            out.append("</tbody></table>")
+            return "".join(out)
+
+        def _top_edges(mat: np.ndarray, cols_: List[str], variant: str) -> List[Tuple[str, str, float]]:
+            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+                return []
+            edges = []
+            n = len(cols_)
+            directed = is_directed_method(variant)
+            pval = is_pvalue_method(variant)
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    if not directed and j <= i:
+                        continue
+                    v = mat[i, j]
+                    if np.isnan(v):
+                        continue
+                    edges.append((cols_[i], cols_[j], float(v)))
+            edges.sort(key=(lambda x: x[2]) if pval else (lambda x: abs(x[2])), reverse=not pval)
+            return edges[:max_edges]
+
+        toc_items = []
+        sections = []
+        for v in variants:
+            info = METHOD_INFO.get(v, {"title": v, "meaning": ""})
+            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(info['title'])}</a></li>")
+
+            mat1 = self.results.get(v)
+            if mat1 is None:
+                mat1 = compute_connectivity_variant(df, v, lag=1, control=None)
+
+            heat = plot_heatmap(mat1, f"{v} heatmap", legend_text="Lag=1")
+            thr = p_alpha if is_pvalue_method(v) else graph_threshold
+            conn = plot_connectome(
+                mat1,
+                f"{v} connectome",
+                threshold=thr,
+                directed=is_directed_method(v),
+                invert_threshold=is_pvalue_method(v),
+                legend_text=f"Lag=1; thr={thr}",
+            )
+            heat_path = _save_png(heat, f"{v}_heatmap.png")
+            conn_path = _save_png(conn, f"{v}_connectome.png")
+
+            edges = _top_edges(mat1, cols, v)
+            edges_html = ["<ol class='edges'>"]
+            for a, b, val in edges:
+                if is_pvalue_method(v):
+                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: p={val:.4g}</li>")
+                else:
+                    edges_html.append(f"<li>{_html.escape(a)} → {_html.escape(b)}: {val:.4g}</li>" if is_directed_method(v)
+                                     else f"<li>{_html.escape(a)} — {_html.escape(b)}: {val:.4g}</li>")
+            edges_html.append("</ol>")
+
+            table_html = _matrix_to_html(mat1, cols) if include_matrix_tables else "<div class='muted'>matrix table disabled</div>"
+            sections.append(
+                f"<section id='{_html.escape(v)}'>"
+                f"<h2>{_html.escape(info['title'])}</h2>"
+                f"<div class='muted'>{_html.escape(info.get('meaning',''))}</div>"
+                f"<div class='grid'><img class='img' src='{heat_path}'/><img class='img' src='{conn_path}'/></div>"
+                f"<h3>Top edges</h3>{''.join(edges_html)}"
+                f"<h3>Matrix (Lag=1)</h3>{table_html}"
+                f"</section>"
+            )
+
+        index_html = f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Time Series Connectivity Report</title>
+  <style>
+    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; padding:0; background:#0b0b0c; color:#eaeaea;}}
+    header{{padding:20px 22px; border-bottom:1px solid #222; position:sticky; top:0; background:#0b0b0c; z-index:10;}}
+    main{{display:grid; grid-template-columns: 320px 1fr; gap:18px; padding:18px 22px;}}
+    nav{{border:1px solid #222; border-radius:12px; padding:14px; height:calc(100vh - 110px); overflow:auto;}}
+    nav ul{{margin:0; padding-left:18px;}}
+    a{{color:#8ab4f8; text-decoration:none;}}
+    a:hover{{text-decoration:underline;}}
+    section{{border:1px solid #222; border-radius:12px; padding:16px; margin-bottom:16px; background:#111;}}
+    .muted{{color:#b7b7b7; font-size:13px;}}
+    .grid{{display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px;}}
+    .img{{max-width:100%; border-radius:10px; border:1px solid #222; background:#0b0b0c;}}
+    .matrix{{border-collapse:collapse; width:100%; overflow:auto; display:block;}}
+    .matrix th,.matrix td{{border:1px solid #2a2a2a; padding:6px 8px; font-size:12px; white-space:nowrap;}}
+    .matrix th{{position:sticky; left:0; background:#141414;}}
+    .edges{{font-size:13px;}}
+    @media (max-width: 1000px){{ main{{grid-template-columns: 1fr;}} nav{{height:auto;}} .grid{{grid-template-columns:1fr;}} }}
+  </style>
+</head>
+<body>
+  <header>
+    <div style="font-size:18px; font-weight:700;">Time Series Connectivity Report</div>
+    <div class="muted">Методы: {len(variants)} • Переменные: {len(cols)} • Длина ряда: {len(df)}</div>
+  </header>
+  <main>
+    <nav>
+      <div style="font-weight:700; margin-bottom:8px;">Оглавление</div>
+      <ul>{''.join(toc_items)}</ul>
+    </nav>
+    <div>
+      {''.join(sections)}
+    </div>
+  </main>
+</body>
+</html>"""
+
+        (outp / "index.html").write_text(index_html, encoding="utf-8")
+
+        if zip_path:
+            zp = Path(zip_path)
+            zp.parent.mkdir(parents=True, exist_ok=True)
+            base = str(zp).removesuffix(".zip")
+            shutil.make_archive(base, "zip", root_dir=str(outp))
+            return str(Path(base + ".zip"))
+        return str(outp)
 
 
 if __name__ == "__main__":
