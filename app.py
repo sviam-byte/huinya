@@ -115,7 +115,7 @@ def main() -> None:
                 f.write(uploaded_file.getbuffer())
 
             enable_experimental = any(m in tool.EXPERIMENTAL_METHODS for m in selected_methods)
-            engine = tool.BigMasterTool(enable_experimental=enable_experimental)
+            engine = tool.BigMasterTool(enable_experimental=False)
             engine.lag_ranges = {v: range(1, lag + 1) for v in tool.method_mapping}
 
             with st.spinner("Обработка данных..."):
@@ -127,7 +127,7 @@ def main() -> None:
                     fill_missing=True,
                     check_stationarity=False,
                 )
-                engine.run_all_methods()
+                engine.run_all_methods(precompute_controls=generate_excel, precompute_pairs=generate_excel)
                 if generate_excel:
                     engine.export_big_excel(
                         output_path,
@@ -156,10 +156,9 @@ def main() -> None:
             st.subheader("Connectome")
             primary_method = resolved_methods[0]
             matrix = tool.compute_connectivity_variant(engine.data_normalized, primary_method, lag=lag)
-            spec = tool.get_method_spec(primary_method)
-            directed = spec.directed
-            invert = spec.is_p_value
-            edge_threshold = alpha if spec.is_p_value else threshold
+            directed = primary_method in getattr(tool, "DIRECTED_METHODS", set()) or ("_directed" in primary_method) or primary_method.startswith(("granger_", "te_", "ah_"))
+            invert = primary_method in getattr(tool, "PVAL_METHODS", set())
+            edge_threshold = alpha if invert else threshold
             connectome = tool.plot_connectome(
                 matrix,
                 f"{primary_method} Connectome",

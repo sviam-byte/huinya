@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import base64
+import datetime as _dt
+import html as _html
 import importlib
 import importlib.util
 import logging
@@ -346,16 +349,19 @@ def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwar
     n = df.shape[1]
     G = np.full((n, n), 1.0)
     cols = df.columns.tolist()
-    for i in range(n):
-        for j in range(n):
-            if i == j: continue
-            data_pair = df[[cols[j], cols[i]]].dropna()
+    # matrix[src, tgt] = pvalue(src -> tgt)
+    for src in range(n):
+        for tgt in range(n):
+            if src == tgt:
+                G[src, tgt] = 0.0
+                continue
+            data_pair = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             if len(data_pair) > lags * 2 + 5:
                 try:
                     tests = grangercausalitytests(data_pair, maxlag=[lags], verbose=False)
-                    G[i, j] = tests[lags][0]['ssr_ftest'][1]
-                except (np.linalg.LinAlgError, ValueError): 
-                    G[i, j] = np.nan
+                    G[src, tgt] = tests[lags][0]['ssr_ftest'][1]
+                except (np.linalg.LinAlgError, ValueError):
+                    G[src, tgt] = np.nan
     return G
 
 def _load_pyinform():
@@ -612,24 +618,23 @@ def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
 
 # эта матрица НЕ ТА ЖЕ ЧТО В МАППИНГЕ
 def _compute_granger_matrix_internal(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG) -> np.ndarray:
-    """Возвращает матрицу p-value Granger в конвенции M[src, tgt]."""
     n = df.shape[1]
     G = np.zeros((n, n))
     cols = df.columns.tolist()
-    for src_idx, src in enumerate(cols):
-        for tgt_idx, tgt in enumerate(cols):
-            if src_idx == tgt_idx:
-                G[src_idx, tgt_idx] = 0.0
+    # matrix[src, tgt] = pvalue(src -> tgt)
+    for src in range(n):
+        for tgt in range(n):
+            if src == tgt:
+                G[src, tgt] = 0.0
                 continue
-            # grangercausalitytests проверяет второй столбец -> первый: подаём [tgt, src]
-            sub = df[[tgt, src]].dropna()
+            sub = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             try:
-                tests = grangercausalitytests(sub, maxlag=lags, verbose=False)
+                tests = grangercausalitytests(sub, maxlag=[lags], verbose=False)
                 pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
-                G[src_idx, tgt_idx] = min(pvals)
+                G[src, tgt] = min(pvals)
             except Exception as e:
-                logging.error(f"[Granger-Internal] Ошибка Granger для {src}->{tgt}: {e}")
-                G[src_idx, tgt_idx] = np.nan
+                logging.error(f"[Granger-Internal] Ошибка Granger для {cols[src]}->{cols[tgt]}: {e}")
+                G[src, tgt] = np.nan
     return G
 
 
@@ -706,60 +711,60 @@ def granger_matrix(df: pd.DataFrame, granger_dict_result: dict) -> np.ndarray:
                     G[i, j] = bp if found_valid_p else np.nan 
     return G
 
-def granger_matrix_partial(df: pd.DataFrame, maxlag: int = 4, control: list = None) -> np.ndarray:
+
+
+def remove_linear_dependency(sub: pd.DataFrame, src: str, tgt: str, control_cols: list) -> tuple[np.ndarray, np.ndarray]:
+    """Удаляет линейную компоненту контролей из src/tgt и возвращает остатки (src_res, tgt_res)."""
+    if not control_cols:
+        r1 = sub[src].to_numpy(dtype=float)
+        r2 = sub[tgt].to_numpy(dtype=float)
+        return r1, r2
+
+    X = sub[control_cols].to_numpy(dtype=float)
+    y_src = sub[src].to_numpy(dtype=float)
+    y_tgt = sub[tgt].to_numpy(dtype=float)
+
+    mdl_src = LinearRegression().fit(X, y_src)
+    mdl_tgt = LinearRegression().fit(X, y_tgt)
+
+    r1 = y_src - mdl_src.predict(X)
+    r2 = y_tgt - mdl_tgt.predict(X)
+    return r1, r2
+
+def granger_matrix_partial(df: pd.DataFrame, maxlag=DEFAULT_MAX_LAG, control=None) -> np.ndarray:
     columns = list(df.columns)
-    n_vars = len(columns)
-    G = np.ones((n_vars, n_vars))
-    
-    def remove_linear_dependency(df, src, tgt, control_cols):
-        #НАДО РЕАЛИЗОВАТЬ ЗАПОЛНИТЕЛЬ НОРМАЛЬНО, удалять и не добавлять НЕХОРОШО
-        if not control_cols:
-            return df[src].values, df[tgt].values
-        
-        X_control = df[control_cols].values
-        y_src = df[src].values
-        y_tgt = df[tgt].values
-        
-        try:
-            reg_src = LinearRegression().fit(X_control, y_src)
-            resid_src = y_src - reg_src.predict(X_control)
-            
-            reg_tgt = LinearRegression().fit(X_control, y_tgt)
-            resid_tgt = y_tgt - reg_tgt.predict(X_control)
-            return resid_src, resid_tgt
-        except Exception:
-            return np.array([]), np.array([]) #фейлится если матрица плохая
-
-
-    for i, tgt in enumerate(columns):
-        for j, src in enumerate(columns):
-            if i == j:
-                G[i, j] = 0
-            else:
-                control_cols = control if control is not None else [c for c in columns if c not in [src, tgt]]
-                sub = df[[src, tgt] + control_cols].dropna()
-                if len(sub) < (maxlag + 10):
-                    G[i, j] = np.nan
-                    continue
-                r1, r2 = remove_linear_dependency(sub, src, tgt, control_cols)
-                if r1.size == 0 or r2.size == 0 or len(r1) != len(r2):
-                    G[i, j] = np.nan
-                    continue
-                dmini = pd.DataFrame({'yy': r2, 'xx': r1}).dropna()
-                if len(dmini) < (maxlag + 10):
-                    G[i, j] = np.nan
-                    continue
-                try:
-                    gg = grangercausalitytests(dmini[['yy', 'xx']], maxlag=maxlag, verbose=False)
-                    bp = 1.0
-                    for lag, dct in gg.items():
-                        F, pval, _, _ = dct[0]['ssr_ftest']
-                        if pval < bp:
-                            bp = pval
-                    G[i, j] = bp
-                except Exception as e:
-                    logging.error(f"[Granger-partial] Ошибка Granger (partial) для {src}->{tgt}: {e}")
-                    G[i, j] = np.nan
+    n = len(columns)
+    G = np.zeros((n, n))
+    # matrix[src, tgt] = pvalue(src -> tgt) c линейным контролем (по умолчанию: все остальные)
+    for src_i, src in enumerate(columns):
+        for tgt_j, tgt in enumerate(columns):
+            if src_i == tgt_j:
+                G[src_i, tgt_j] = 0.0
+                continue
+            control_cols = control if control is not None else [c for c in columns if c not in [src, tgt]]
+            sub = df[[src, tgt] + control_cols].dropna()
+            if len(sub) < (maxlag + 10):
+                G[src_i, tgt_j] = np.nan
+                continue
+            r1, r2 = remove_linear_dependency(sub, src, tgt, control_cols)
+            if r1.size == 0 or r2.size == 0 or len(r1) != len(r2):
+                G[src_i, tgt_j] = np.nan
+                continue
+            dmini = pd.DataFrame({'yy': r2, 'xx': r1}).dropna()
+            if len(dmini) < (maxlag + 10):
+                G[src_i, tgt_j] = np.nan
+                continue
+            try:
+                gg = grangercausalitytests(dmini[['yy', 'xx']], maxlag=maxlag, verbose=False)
+                bp = 1.0
+                for l in gg:
+                    p = gg[l][0]['ssr_ftest'][1]
+                    if p < bp:
+                        bp = p
+                G[src_i, tgt_j] = bp
+            except Exception as e:
+                logging.error(f"[Granger-partial] Ошибка Granger (partial) для {src}->{tgt}: {e}")
+                G[src_i, tgt_j] = np.nan
     return G
 
 ##############################################
@@ -975,22 +980,31 @@ def plot_connectome(matrix: np.ndarray, method_name: str, threshold: float = 0.2
     n = matrix.shape[0]
     G = nx.DiGraph() if directed else nx.Graph()
     G.add_nodes_from(range(n))
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            if not directed and j < i:
-                continue
-            val = matrix[i, j]
-            if val is None or np.isnan(val):
-                continue
-            if invert_threshold:
-                # p-value: меньше = лучше
-                if val <= threshold:
-                    G.add_edge(i, j, weight=val)
-            else:
-                if abs(val) >= threshold:
-                    G.add_edge(i, j, weight=val)
+    # ВАЖНО: договоримся об ориентации:
+    # matrix[src, tgt] — влияние src -> tgt
+    if directed:
+        for src in range(n):
+            for tgt in range(n):
+                if src == tgt:
+                    continue
+                w = matrix[src, tgt]
+                if w is None or np.isnan(w):
+                    continue
+                if invert_threshold:
+                    # p-value: меньше => сильнее
+                    if w < threshold:
+                        G.add_edge(src, tgt, weight=float(w))
+                else:
+                    if abs(w) > threshold:
+                        G.add_edge(src, tgt, weight=float(w))
+    else:
+        for i in range(n):
+            for j in range(i + 1, n):
+                w = matrix[i, j]
+                if w is None or np.isnan(w):
+                    continue
+                if abs(w) > threshold:
+                    G.add_edge(i, j, weight=float(w))
     pos = nx.circular_layout(G)
     fig, ax = plt.subplots(figsize=(4, 4))
     if directed:
@@ -1024,7 +1038,7 @@ def add_method_to_sheet(ws, row: int, title: str, matrix: np.ndarray, directed: 
     img_heat.width = 400
     img_heat.height = 300
     ws.add_image(img_heat, f"A{ws.max_row + 2}")
-    buf_conn = plot_connectome(matrix, title + " Connectome", threshold=DEFAULT_EDGE_THRESHOLD, directed=directed, invert_threshold=False, legend_text=legend_text)
+    buf_conn = plot_connectome(matrix, title + " Connectome", threshold=0.2, directed=directed, invert_threshold=False, legend_text=legend_text)
     img_conn = Image(buf_conn)
     img_conn.width = 400
     img_conn.height = 400
@@ -1064,8 +1078,8 @@ method_mapping = {
 # ...
     # ——— Granger causality ———
     "granger_full":         lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
-    "granger_partial":      lambda data, lag, control=None: compute_partial_granger_matrix(data, lags=lag), 
-    "granger_directed":     lambda data, lag, control=None: _compute_granger_matrix_internal(data, lags=lag),
+    "granger_partial":      lambda data, lag, control=None: granger_matrix_partial(data, maxlag=lag, control=control), 
+    "granger_directed":     lambda data, lag, control=None: compute_partial_granger_matrix(data, lags=lag),
 # ...
 
     # ——— Transfer entropy ———
@@ -1094,55 +1108,49 @@ class MethodSpec:
     description: str = ""
 
 # ВАЖНО: конвенция для directed-матриц — M[src, tgt]
-_DIRECTED_METHODS = {
-    "correlation_directed",
-    "h2_directed",
-    "granger_full",
-    "granger_partial",
-    "granger_directed",
-    "te_full",
-    "te_partial",
-    "te_directed",
-    "ah_full",
-    "ah_partial",
-    "ah_directed",
+PVAL_METHODS = {"granger_full", "granger_partial"}          # матрица p-value (меньше => сильнее)
+DIRECTED_METHODS = {
+    "correlation_directed", "h2_directed",
+    "granger_full", "granger_partial", "granger_directed",
+    "te_full", "te_partial", "te_directed",
+    "ah_full", "ah_partial", "ah_directed",
 }
-_PVALUE_METHODS = {"granger_full", "granger_directed"}
-_CONTROL_DEPENDENT = {
-    "correlation_partial",
-    "h2_partial",
-    "mutinf_partial",
-    "te_partial",
-    "te_directed",
-    "ah_partial",
-    "ah_directed",
-}
-_LAG_SUPPORTED = {
-    "correlation_directed",
-    "h2_directed",
-    "granger_full",
-    "granger_partial",
-    "granger_directed",
-    "te_full",
-    "te_partial",
-    "te_directed",
-    "ah_full",
-    "ah_partial",
-    "ah_directed",
-}
+
+
+def _is_pvalue_method(variant: str) -> bool:
+    return variant in PVAL_METHODS
+
+
+def _is_directed_method(variant: str) -> bool:
+    return variant in DIRECTED_METHODS
+
+
+def _lag_quality(variant: str, mat: np.ndarray) -> float:
+    """Скалярная метрика качества лага: больше => лучше (единая конвенция)."""
+    if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+        return np.nan
+    n = mat.shape[0]
+    if n < 2:
+        return np.nan
+    mask = ~np.eye(n, dtype=bool)
+    vals = mat[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    if _is_pvalue_method(variant):
+        # p-value: меньше лучше -> переводим в "evidence" (больше лучше)
+        vals = np.clip(vals, 1e-12, 1.0)
+        return float(np.mean(-np.log10(vals)))
+    return float(np.mean(np.abs(vals)))
 
 
 def get_method_spec(variant: str) -> MethodSpec:
-    v = variant.lower()
-    directed = variant in _DIRECTED_METHODS or ("directed" in v) or (variant in {"granger_full", "te_full", "ah_full"})
-    is_p_value = variant in _PVALUE_METHODS
-    control_dependent = variant in _CONTROL_DEPENDENT
-    supports_lag = variant in _LAG_SUPPORTED
+    """Совместимость со старым API: возвращает MethodSpec на основе новых семантических множеств."""
     return MethodSpec(
-        directed=directed,
-        is_p_value=is_p_value,
-        control_dependent=control_dependent,
-        supports_lag=supports_lag,
+        directed=_is_directed_method(variant),
+        is_p_value=_is_pvalue_method(variant),
+        control_dependent=("partial" in variant),
+        supports_lag=_is_directed_method(variant),
     )
 
 def compute_connectivity_variant(data, variant, lag=1, control=None):
@@ -1575,15 +1583,7 @@ class BigMasterTool:
         for lag in tqdm(candidate_lags, desc=f"Optimizing lag for {variant}"):
             try:
                 mat = compute_connectivity_variant(original_data, variant, lag)
-                if mat is not None and hasattr(mat, "shape") and mat.shape == (original_data.shape[1], original_data.shape[1]):
-
-                    if mat.shape[0] > 1:
-                        off = mat[~np.eye(mat.shape[0], dtype=bool)]
-                        metric = np.nanmean(off) if spec.is_p_value else np.nanmean(np.abs(off))
-                    else: 
-                        metric = np.nan
-                else:
-                    metric = np.nan
+                metric = _lag_quality(variant, mat)
                 lag_metrics[lag] = (metric, mat)
             except Exception as ex:
                 logging.error(f"[Lag] Ошибка {variant} lag={lag}: {ex}")
@@ -1645,7 +1645,7 @@ class BigMasterTool:
         return mat[i, j]
 
 
-    def run_all_methods(self) -> None:
+    def run_all_methods(self, precompute_controls: bool = False, precompute_pairs: bool = False) -> None:
         self.normalize_data()
         if self.data_normalized.empty:
             logging.warning("[RunAll] Нет данных для выполнения анализа.")
@@ -1679,8 +1679,10 @@ class BigMasterTool:
                 self.lag_ranges.get(variant, range(1, 21)),
             )
 
-        self.compute_all_matrices()
-        self.prepare_pairs()
+        if precompute_controls:
+            self.compute_all_matrices()
+        if precompute_pairs:
+            self.prepare_pairs()
         logging.info("[RunAll] Все методы завершены.")
 
     def analyze_sliding_windows(self, variant: str, window_size: int = 100, overlap: int = 50, threshold: float = 0.2) -> dict:
@@ -2041,30 +2043,22 @@ class BigMasterTool:
             ws.column_dimensions[get_column_letter(col[0].column)].width = max_length
 
     def select_lag_metrics(self, lag_res: dict, variant: str):
-        if not lag_res:
-            return None, None, None
-        spec = get_method_spec(variant)
-        valid = {l: v for l, v in lag_res.items() if v is not None and v[0] is not None and not np.isnan(v[0])}
+        valid = [l for l in lag_res if lag_res[l] is not None and lag_res[l][0] is not None and not np.isnan(lag_res[l][0])]
         if not valid:
             return None, None, None
-        lags = list(valid.keys())
-        metrics = np.array([valid[l][0] for l in lags], dtype=float)
-        if spec.is_p_value:
-            best = lags[int(np.nanargmin(metrics))]
-            worst = lags[int(np.nanargmax(metrics))]
-        else:
-            best = lags[int(np.nanargmax(metrics))]
-            worst = lags[int(np.nanargmin(metrics))]
-        median_val = np.nanmedian(metrics)
-        median = lags[int(np.nanargmin(np.abs(metrics - median_val)))]
+        metrics = [lag_res[l][0] for l in valid]
+        # metric уже приведён к "больше => лучше" для всех методов
+        best = max(valid, key=lambda l: lag_res[l][0])
+        worst = min(valid, key=lambda l: lag_res[l][0])
+        median = min(valid, key=lambda l: abs(lag_res[l][0] - np.median(metrics)))
         return best, median, worst
 
 
-    def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, p_value_alpha: float, window_size: int, overlap: int) -> None:
-        spec = get_method_spec(variant)
-        directed_flag = spec.directed
-        edge_threshold = p_value_alpha if spec.is_p_value else threshold
-        invert_threshold = True if spec.is_p_value else False
+    def export_method_sheet(self, wb: Workbook, variant: str, threshold: float, window_size: int, overlap: int, p_value_alpha: float = 0.05) -> None:
+        directed_flag = _is_directed_method(variant)
+        is_pval = _is_pvalue_method(variant)
+        edge_threshold = p_value_alpha if is_pval else threshold
+        invert_threshold = True if is_pval else False
         ws = wb.create_sheet(variant.upper() + " Results")
         ws.append([f"Метод: {variant.upper()} (Лаг = 1, окно = {window_size})"])
         if spec.is_p_value:
@@ -2171,9 +2165,9 @@ class BigMasterTool:
             ws.add_image(img_best_conn, "G40")
         ws.append(["--- Конец листа ---"])
 
-    def export_summary_sheet(self, wb: Workbook, threshold: float, p_value_alpha: float) -> None:
+    def export_summary_sheet(self, wb: Workbook, graph_threshold: float = 0.2, p_value_alpha: float = 0.05) -> None:
         ws_summary = wb.create_sheet("Summary")
-        full_methods = [m for m in self.results if "partial" not in m and m != "granger_directed"]        
+        full_methods = [m for m in self.lag_results.keys()]        
         undirected_pairs = list(combinations(self.data.columns, 2))
         directed_pairs = list(permutations(self.data.columns, 2))
         
@@ -2192,7 +2186,7 @@ class BigMasterTool:
         indices = {c: i for i, c in enumerate(self.data.columns)}
         
         for variant in full_methods:
-            spec = get_method_spec(variant); is_p_value = spec.is_p_value
+            spec = get_method_spec(variant); is_pval = _is_pvalue_method(variant)
             lag_res = self.lag_results.get(variant, {}) # берём превыч
             
             best_lag, median_lag, _ = self.select_lag_metrics(lag_res, variant)
@@ -2276,10 +2270,10 @@ class BigMasterTool:
                 if cell.value != "N/A":
                     try:
                         v = float(cell.value)
-                        if is_p_value:
-                            cell.fill = fill_green if v <= p_value_alpha else fill_pink
+                        if _is_pvalue_method(variant):
+                            cell.fill = fill_green if v < p_value_alpha else fill_pink
                         else:
-                            cell.fill = fill_green if abs(v) >= threshold else fill_pink
+                            cell.fill = fill_green if abs(v) > graph_threshold else fill_pink
                     except:
                         pass
         
@@ -2331,7 +2325,7 @@ class BigMasterTool:
         wb = Workbook()
         wb.remove(wb.active)
         add_raw_data_sheet(wb, self.data) 
-        self.export_summary_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
+        self.export_summary_sheet(wb, graph_threshold=threshold, p_value_alpha=p_value_alpha)
         self.export_undirected_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
         self.export_directed_sheet(wb, threshold=threshold, p_value_alpha=p_value_alpha)
         ws_diag = wb.create_sheet("Data & Diagnostics")
@@ -2367,7 +2361,7 @@ class BigMasterTool:
         
         # --- ЛИСТЫ методов отдельно ---
         for variant in method_mapping.keys():
-            self.export_method_sheet(wb, variant, threshold=threshold, p_value_alpha=p_value_alpha, window_size=window_size, overlap=overlap)
+            self.export_method_sheet(wb, variant, threshold=threshold, window_size=window_size, overlap=overlap, p_value_alpha=p_value_alpha)
         
         self.export_hurst_sheet(wb, "Hurst_RS", self.compute_hurst_rs, self.plot_autocorrelation)
         self.export_hurst_sheet(wb, "Hurst_DFA", self.compute_hurst_dfa, self.plot_power_spectrum)
@@ -2482,7 +2476,7 @@ class BigMasterTool:
 
         for report_label, method_variant in methods_to_get.items():
             # ПРЕДЗАДАННЫЕ КОНТРОЛЬНЫЕ для этих там
-            control_vars = list(df_for_analysis.columns) if 'partial' in method_variant else None
+            control_vars = None
             
             lag = lag_params.get(method_variant, DEFAULT_MAX_LAG)
             
@@ -2504,7 +2498,7 @@ class BigMasterTool:
         if df_for_analysis.empty: return {k: None for k in methods_to_get}
 
         for report_label, method_variant in methods_to_get.items():
-            control_vars = list(df_for_analysis.columns) if 'partial' in method_variant else None
+            control_vars = None
             
             lag = lag_params.get(method_variant, DEFAULT_MAX_LAG)
             
@@ -2513,7 +2507,7 @@ class BigMasterTool:
             if matrix is not None:
                 spec = get_method_spec(method_variant)
                 is_directed = spec.directed
-                is_p_value = spec.is_p_value
+                is_pval = _is_pvalue_method(variant)
                 edge_threshold = DEFAULT_PVALUE_ALPHA if spec.is_p_value else DEFAULT_EDGE_THRESHOLD 
                 invert_threshold = True if is_p_value else False
 
@@ -2524,6 +2518,128 @@ class BigMasterTool:
             else:
                 generated_connectomes[report_label] = None
         return generated_connectomes
+
+
+    # -----------------------------
+    # Self-contained HTML отчёт
+    # -----------------------------
+    def export_html_report(
+        self,
+        output_path: str,
+        graph_threshold: float = 0.2,
+        p_value_alpha: float = 0.05,
+        methods: Optional[List[str]] = None,
+        include_images: bool = True,
+    ) -> str:
+        if self.data_normalized.empty:
+            self.normalize_data()
+        df_for_analysis = self.data_normalized[[c for c in self.data_normalized.columns if c.startswith("c")]]
+        if df_for_analysis.empty:
+            raise ValueError("Нет колонок c* для анализа (df_for_analysis пуст).")
+
+        methods = methods or list(method_mapping.keys())
+        cols = list(df_for_analysis.columns)
+
+        def _buf_to_data_uri(buf: BytesIO) -> str:
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{b64}"
+
+        def _matrix_html(mat: np.ndarray) -> str:
+            if mat is None:
+                return "<p><em>Нет данных (матрица None).</em></p>"
+            d = pd.DataFrame(mat, index=cols, columns=cols)
+            return d.to_html(border=0, escape=True, float_format=lambda x: f"{x:.4g}")
+
+        def _interpretation(variant: str) -> str:
+            if _is_pvalue_method(variant):
+                return (
+                    "<p><b>Семантика:</b> элементы — p-value для проверки Granger src→tgt. "
+                    f"Рёбра рисуются при p &lt; {p_value_alpha:g}. Меньше p — сильнее свидетельство.</p>"
+                )
+            if variant.startswith("correlation"):
+                return "<p><b>Семантика:</b> корреляция (знак важен), рёбра по |w| ≥ threshold.</p>"
+            if variant.startswith("h2"):
+                return "<p><b>Семантика:</b> H² = corr² (0..1), рёбра по w ≥ threshold.</p>"
+            if variant.startswith("mutual_info") or variant.startswith("mutinf"):
+                return "<p><b>Семантика:</b> взаимная информация (≥0), рёбра по w ≥ threshold.</p>"
+            if variant.startswith("coherence"):
+                return "<p><b>Семантика:</b> средняя когерентность (0..1), рёбра по w ≥ threshold.</p>"
+            if variant.startswith("te"):
+                return "<p><b>Семантика:</b> transfer entropy src→tgt (≥0), рёбра по w ≥ threshold.</p>"
+            if variant.startswith("ah"):
+                return "<p><b>Семантика:</b> AH-направленность src→tgt (0..1), рёбра по w ≥ threshold.</p>"
+            if variant == "granger_directed":
+                return "<p><b>Семантика:</b> VAR-based strength (лог-отношение дисперсий) src→tgt, не p-value.</p>"
+            return "<p><b>Семантика:</b> см. реализацию метода.</p>"
+
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        toc_items = []
+        sections = []
+
+        sections.append(f"<h1 id='top'>Connectivity Report</h1><p><em>{_html.escape(now)}</em></p>")
+        sections.append(
+            f"<h2 id='data'>Data</h2>"
+            f"<p>Rows: {len(df_for_analysis)}, Vars: {len(cols)} ({', '.join(map(_html.escape, cols))})</p>"
+        )
+
+        sections.append("<h2 id='methods'>Methods</h2>")
+        for v in methods:
+            toc_items.append(f"<li><a href='#{_html.escape(v)}'>{_html.escape(v)}</a></li>")
+        sections.append("<ul>" + "".join(toc_items) + "</ul>")
+
+        for variant in methods:
+            is_pval = _is_pvalue_method(variant)
+            is_dir = _is_directed_method(variant)
+            thr = p_value_alpha if is_pval else graph_threshold
+            inv = True if is_pval else False
+
+            lag = 1
+            mat = None
+            if hasattr(self, "lag_results") and variant in self.lag_results and self.lag_results[variant]:
+                best_lag, _, _ = self.select_lag_metrics(self.lag_results[variant], variant)
+                if best_lag is not None:
+                    lag = int(best_lag)
+                    mat = self.lag_results[variant][best_lag][1]
+            if mat is None:
+                mat = compute_connectivity_variant(df_for_analysis, variant, lag=lag, control=None)
+
+            sections.append(f"<hr/><h2 id='{_html.escape(variant)}'>{_html.escape(variant)}</h2>")
+            sections.append(_interpretation(variant))
+            sections.append(f"<p><b>Lag:</b> {lag} &nbsp; <b>Threshold:</b> {thr:g}</p>")
+
+            sections.append("<details open><summary><b>Matrix</b></summary>")
+            sections.append(_matrix_html(mat))
+            sections.append("</details>")
+
+            if include_images and mat is not None:
+                hm = plot_heatmap(mat, f"{variant} heatmap", legend_text=f"lag={lag}")
+                cm = plot_connectome(mat, f"{variant} connectome", threshold=thr, directed=is_dir, invert_threshold=inv, legend_text=f"lag={lag}")
+                sections.append("<div style='display:flex; gap:16px; flex-wrap:wrap'>")
+                sections.append(f"<div><h3>Heatmap</h3><img style='max-width:420px' src='{_buf_to_data_uri(hm)}'/></div>")
+                sections.append(f"<div><h3>Connectome</h3><img style='max-width:420px' src='{_buf_to_data_uri(cm)}'/></div>")
+                sections.append("</div>")
+
+        style = """
+        <style>
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+          code, pre { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+          table { border-collapse: collapse; }
+          th, td { padding: 6px 10px; border-bottom: 1px solid #e5e5e5; font-size: 13px; }
+          th { text-align:left; position: sticky; top: 0; background: #fff; }
+          details { margin: 10px 0; }
+        </style>
+        """
+        html_doc = (
+            "<!doctype html><html><head><meta charset='utf-8'/>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+            f"<title>Connectivity Report</title>{style}</head><body>"
+            "<p><a href='#top'>↑ top</a></p>"
+            + "".join(sections)
+            + "</body></html>"
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        return output_path
 
 
 if __name__ == "__main__":
@@ -2611,18 +2727,35 @@ if __name__ == "__main__":
         fill_missing=True,
         check_stationarity=not args.no_stationarity_check,
     )
-    tool.run_all_methods()
-    tool.export_big_excel(
-        output_path,
-        threshold=args.graph_threshold,
-        p_value_alpha=args.pvalue_alpha,
-        window_size=100,
-        overlap=50,
-        log_transform=args.log,
-        remove_outliers=not args.no_outliers,
-        normalize=not args.no_normalize,
-        fill_missing=True,
-        check_stationarity=not args.no_stationarity_check,
-    )
+    tool.run_all_methods(precompute_controls=not args.no_excel, precompute_pairs=not args.no_excel)
+    do_excel = not args.no_excel
+    do_report = bool(args.report_html)
+    if not do_excel and not do_report:
+        do_excel = True
+
+    if do_excel:
+        tool.export_big_excel(
+            output_path,
+            threshold=args.graph_threshold,
+            p_value_alpha=args.pvalue_alpha,
+            window_size=100,
+            overlap=50,
+            log_transform=args.log,
+            remove_outliers=not args.no_outliers,
+            normalize=not args.no_normalize,
+            fill_missing=True,
+            check_stationarity=not args.no_stationarity_check,
+        )
+
+    if do_report:
+        report_path = os.path.abspath(args.report_html)
+        report_dir = os.path.dirname(report_path)
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
+        tool.export_html_report(
+            report_path,
+            graph_threshold=args.graph_threshold,
+            p_value_alpha=args.pvalue_alpha,
+        )
 
     print("Анализ завершён, результаты сохранены в:", output_path)
