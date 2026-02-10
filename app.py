@@ -104,7 +104,8 @@ def main() -> None:
             with open(input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
-            engine = tool.BigMasterTool(enable_experimental=False)
+            enable_experimental = any(m in tool.EXPERIMENTAL_METHODS for m in selected_methods)
+            engine = tool.BigMasterTool(enable_experimental=enable_experimental)
             engine.lag_ranges = {v: range(1, lag + 1) for v in tool.method_mapping}
 
             with st.spinner("Обработка данных..."):
@@ -144,12 +145,14 @@ def main() -> None:
             st.subheader("Connectome")
             primary_method = resolved_methods[0]
             matrix = tool.compute_connectivity_variant(engine.data_normalized, primary_method, lag=lag)
-            directed = "directed" in primary_method or "partial" in primary_method
-            invert = "granger" in primary_method
+            spec = tool.get_method_spec(primary_method)
+            directed = spec.directed
+            invert = spec.is_p_value
+            edge_threshold = 0.05 if spec.is_p_value else threshold
             connectome = tool.plot_connectome(
                 matrix,
                 f"{primary_method} Connectome",
-                threshold=threshold,
+                threshold=edge_threshold,
                 directed=directed,
                 invert_threshold=invert,
                 legend_text=f"Lag={lag}",
