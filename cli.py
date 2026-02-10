@@ -14,6 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Compute connectivity measures for multivariate time series.")
     p.add_argument("input_file", help="Path to input CSV or Excel file with time series data")
     p.add_argument("--lags", type=int, default=5, help="Max lag/model order (for Granger, TE, etc.)")
+    p.add_argument("--header", choices=["auto", "yes", "no"], default="auto", help="Header mode for input parser")
+    p.add_argument("--time-col", dest="time_col", default="auto", help="Time/index column mode: auto|none|<column_name>")
+    p.add_argument("--transpose", choices=["auto", "yes", "no"], default="auto", help="Transpose mode for parsed table")
+    p.add_argument("--no-preprocess", action="store_true", help="Disable all preprocessing (assume data already prepared)")
     p.add_argument("--log", action="store_true", help="Apply logarithm transform to data (for positive-valued data)")
     p.add_argument("--no-outliers", action="store_true", help="Disable outlier removal")
     p.add_argument("--no-normalize", action="store_true", help="Disable normalization of data")
@@ -48,6 +52,10 @@ def main() -> None:
 
     tool.load_data_excel(
         filepath,
+        header=args.header,
+        time_col=args.time_col,
+        transpose=args.transpose,
+        preprocess=(not args.no_preprocess),
         log_transform=args.log,
         remove_outliers=not args.no_outliers,
         normalize=not args.no_normalize,
