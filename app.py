@@ -10,6 +10,7 @@ Light Streamlit demo.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from types import ModuleType
 from typing import List, Mapping, Sequence
@@ -49,7 +50,7 @@ def main() -> None:
         lag = st.number_input("Lag", min_value=1, max_value=50, value=1, step=1)
     with col2:
         threshold = st.number_input(
-            "Threshold",
+            "Weight threshold",
             min_value=0.0,
             max_value=1.0,
             value=0.2,
@@ -58,6 +59,15 @@ def main() -> None:
     with col3:
         normalize = st.checkbox("normalize", value=True)
 
+
+    # Для p-value (Granger full / directed) нужен отдельный порог
+    alpha = st.number_input(
+        "p-value alpha (for Granger p-values)",
+        min_value=0.001,
+        max_value=1.0,
+        value=0.05,
+        step=0.01,
+    )
     col4, col5, col6 = st.columns(3)
     with col4:
         remove_outliers = st.checkbox("outliers", value=True)
@@ -72,10 +82,12 @@ def main() -> None:
         st.info("TE-методы скрыты: установи pyinform (локально), если нужно.")
 
     method_options = tool.STABLE_METHODS + tool.EXPERIMENTAL_METHODS
+    if not tool.PYINFORM_AVAILABLE:
+        method_options = [m for m in method_options if not m.startswith("te_")]
     selected_methods = st.multiselect(
         "Methods",
         options=method_options,
-        default=tool.STABLE_METHODS,
+        default=[m for m in tool.STABLE_METHODS if m in method_options],
     )
 
     if any(method in tool.EXPERIMENTAL_METHODS for method in selected_methods):
@@ -83,6 +95,8 @@ def main() -> None:
 
     is_cloud = _is_cloud_env()
     generate_excel = False
+    generate_html = True
+    generate_site = False
     if is_cloud:
         st.info("В облаке полный Excel-отчёт отключён (слишком тяжело для Streamlit Cloud).")
     else:
@@ -91,6 +105,9 @@ def main() -> None:
             value=False,
             help="Создаёт полный отчёт. Может занять время и много памяти.",
         )
+    generate_html = st.checkbox("Generate HTML report (fast)", value=True)
+    if not is_cloud:
+        generate_site = st.checkbox("Generate mini-site report (zip)", value=False)
 
     if st.button("Run", type="primary"):
         if not uploaded_file:
@@ -100,10 +117,12 @@ def main() -> None:
         suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
         with tempfile.TemporaryDirectory() as tmp_dir:
             input_path = os.path.join(tmp_dir, f"input{suffix}")
+            output_path = os.path.join(tmp_dir, "AllMethods_Full.xlsx")
 
             with open(input_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
+            enable_experimental = any(m in tool.EXPERIMENTAL_METHODS for m in selected_methods)
             engine = tool.BigMasterTool(enable_experimental=False)
             engine.lag_ranges = {v: range(1, lag + 1) for v in tool.method_mapping}
 
@@ -117,10 +136,14 @@ def main() -> None:
                     check_stationarity=False,
                 )
                 engine.run_all_methods()
+                html_path = os.path.join(tmp_dir, "report.html")
+                site_dir = os.path.join(tmp_dir, "site_report")
+                site_zip = os.path.join(tmp_dir, "site_report.zip")
                 if generate_excel:
                     engine.export_big_excel(
                         output_path,
                         threshold=threshold,
+                        p_value_alpha=alpha,
                         window_size=100,
                         overlap=50,
                         log_transform=log_transform,
@@ -129,6 +152,10 @@ def main() -> None:
                         fill_missing=True,
                         check_stationarity=False,
                     )
+                if generate_html:
+                    engine.export_html_report(html_path, graph_threshold=threshold, p_alpha=0.05)
+                if generate_site:
+                    engine.export_site_report(site_dir, graph_threshold=threshold, p_alpha=0.05, zip_path=site_zip)
 
             resolved_methods = _resolve_selected_methods(selected_methods, tool.method_mapping)
             if not resolved_methods:
@@ -144,12 +171,13 @@ def main() -> None:
             st.subheader("Connectome")
             primary_method = resolved_methods[0]
             matrix = tool.compute_connectivity_variant(engine.data_normalized, primary_method, lag=lag)
-            directed = "directed" in primary_method or "partial" in primary_method
-            invert = "granger" in primary_method
+            directed = tool.is_directed_method(primary_method)
+            invert = tool.is_pvalue_method(primary_method)
+            thr = 0.05 if invert else threshold
             connectome = tool.plot_connectome(
                 matrix,
                 f"{primary_method} Connectome",
-                threshold=threshold,
+                threshold=thr,
                 directed=directed,
                 invert_threshold=invert,
                 legend_text=f"Lag={lag}",
@@ -163,6 +191,22 @@ def main() -> None:
                         data=f.read(),
                         file_name="AllMethods_Full.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            if generate_html:
+                with open(html_path, "rb") as f:
+                    st.download_button(
+                        "Download HTML report",
+                        data=f.read(),
+                        file_name="report.html",
+                        mime="text/html",
+                    )
+            if generate_site and (not is_cloud):
+                with open(site_zip, "rb") as f:
+                    st.download_button(
+                        "Download mini-site (zip)",
+                        data=f.read(),
+                        file_name="site_report.zip",
+                        mime="application/zip",
                     )
             else:
                 st.caption(
